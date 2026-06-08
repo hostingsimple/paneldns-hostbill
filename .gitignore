@@ -1,0 +1,15 @@
+# Build artefacts
+dist/
+*.zip
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# PHP temp
+/tmp/

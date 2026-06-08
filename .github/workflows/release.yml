@@ -1,0 +1,106 @@
+name: Release
+
+# Fires when a vX.Y.Z tag is pushed.
+# Packages the HostBill module into a ZIP and attaches it to a GitHub Release.
+# Manual trigger is also available for emergency re-builds without re-tagging.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to re-build (e.g. v1.0.0)'
+        required: true
+
+jobs:
+  build:
+    name: Build release ZIP
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required to create releases and upload assets
+
+    env:
+      # Opt JavaScript actions into Node 24 ahead of the Node 20 deprecation.
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+    steps:
+      - name: Resolve tag name
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.name }}
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: zip
+          coverage: none
+
+      - name: Build ZIP
+        env:
+          VERSION: ${{ steps.tag.outputs.name }}
+        run: |
+          set -euo pipefail
+          TAG="${VERSION}"
+          OUT="dist/paneldns-hostbill-${TAG}.zip"
+          mkdir -p dist
+
+          # Copy the HostBill module into the standard HostBill install layout:
+          #   includes/modules/Hosting/paneldns/class.paneldns.php
+          #   includes/modules/Hosting/paneldns/shared/PanelDnsApi.php
+          #   includes/modules/Hosting/paneldns/shared/LicenceCheck.php
+          STAGING="$(mktemp -d)/paneldns-hostbill"
+          MODDIR="${STAGING}/includes/modules/Hosting/paneldns"
+          mkdir -p "${MODDIR}/shared"
+          mkdir -p "${MODDIR}/paneldns"
+
+          cp modules/servers/paneldns/class.paneldns.php "${MODDIR}/class.paneldns.php"
+          cp shared/PanelDnsApi.php    "${MODDIR}/shared/PanelDnsApi.php"
+          cp shared/LicenceCheck.php  "${MODDIR}/shared/LicenceCheck.php"
+
+          # Update require_once paths for the flattened ZIP layout.
+          # In the ZIP: shared/ is at the same depth as class.paneldns.php (both in paneldns/).
+          # So the paths become __DIR__ . '/shared/PanelDnsApi.php' etc.
+          sed -i \
+            "s|require_once __DIR__ . '/../../../shared/PanelDnsApi.php'|require_once __DIR__ . '/shared/PanelDnsApi.php'|g" \
+            "${MODDIR}/class.paneldns.php"
+          sed -i \
+            "s|require_once __DIR__ . '/../../../shared/LicenceCheck.php'|require_once __DIR__ . '/shared/LicenceCheck.php'|g" \
+            "${MODDIR}/class.paneldns.php"
+
+          # Write the ZIP.
+          cd "$(dirname "${STAGING}")"
+          zip -r "${OLDPWD}/${OUT}" "paneldns-hostbill"
+          echo "Built ${OUT}"
+          ls -lh "${OLDPWD}/${OUT}"
+
+      - name: Create / update GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: ${{ steps.tag.outputs.name }}
+          body: |
+            Built from `${{ steps.tag.outputs.name }}` by GitHub Actions.
+
+            ## Installation
+
+            1. Download `paneldns-hostbill-${{ steps.tag.outputs.name }}.zip`
+            2. Extract and copy the `includes/` folder into your HostBill root
+            3. Go to **Settings → Apps → Add New App** and choose **PanelDNS**
+            4. See [README.md](https://github.com/Veeau/paneldns-hostbill/blob/${{ steps.tag.outputs.name }}/README.md) for full configuration instructions
+
+            See [CHANGELOG.md](https://github.com/Veeau/paneldns-hostbill/blob/${{ steps.tag.outputs.name }}/CHANGELOG.md) for what changed.
+          files: |
+            dist/paneldns-hostbill-*.zip
+          draft: false
+          prerelease: ${{ contains(steps.tag.outputs.name, 'rc') || contains(steps.tag.outputs.name, 'beta') || contains(steps.tag.outputs.name, 'alpha') }}
