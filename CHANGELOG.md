@@ -1,5 +1,56 @@
 # Changelog
 
+## v2.1.0 — 2026-06-09
+
+Parity fixes against `paneldns-reseller-whmcs` identified by gap analysis.
+
+### Fixed
+
+- **Exception wrapping in lifecycle methods** (ERR-01) — `Create()`, `Suspend()`,
+  `Unsuspend()`, `Terminate()`, and `ChangePackage()` now catch all `\Throwable` exceptions,
+  log them via `error_log()` with class + message, and return a generic error string to
+  HostBill. Stack traces containing API tokens or internal paths can no longer reach the
+  HostBill admin UI. Mirrors `PanelDnsResellerService::run()` in the WHMCS module.
+
+- **Rate limiting in `clientArea()`** (RATE-01) — all client-area requests are now limited
+  to 60 per minute per service using a session-based sliding-window counter. Returns an alert
+  and blocks further rendering when the limit is exceeded. Mirrors `EmbeddedDnsManager`'s
+  `FIX-M6` rate limiter; uses session storage in place of `\WHMCS\Cache\Store` which is not
+  available in HostBill.
+
+- **Zone import redirects to records page** — `doZoneImport()` now navigates to the records
+  page for the just-imported zone on success instead of the zones list. Matches WHMCS
+  `EmbeddedDnsManager::doZoneImport()` which calls `redirectTo('records', "&zone={$zoneId}")`.
+
+- **SSO failure logging** (LOG-SSO-01) — `ssoLogin()` now logs a failure message via
+  `error_log()` when `mintSubClientSsoToken()` returns a non-OK response or an invalid URL.
+  The error is not shown to the client. Mirrors `logModuleCall()` usage in the WHMCS module's
+  `clientSso()` and `adminSso()` methods.
+
+- **Sub-client creation uses HostBill service password** (PASS-01) — `Create()` now reads
+  `$this->account_details['password']` first; falls back to `bin2hex(random_bytes(12))` only
+  when no service password is present. Mirrors `$params['password']` in the WHMCS module's
+  `createAccount()`.
+
+- **Grace period deadline persisted to per-account details** (GRACE-01) — `Terminate()` now
+  writes the calculated grace deadline (`YYYY-MM-DD`) to `$this->details['option2']['value']`
+  (the new "Grace Period Deadline" detail field) when suspending under a grace period. This
+  makes the deadline visible in the HostBill admin service view and queryable by the Task
+  Scheduler, mirroring the `[paneldns-grace:{deadline}]` marker written to `tblhosting.notes`
+  in the WHMCS module. The field is also cleared on a hard delete.
+
+### Added
+
+- **`Grace Period Deadline` per-account detail field** (`details.option2`) — a new read-only
+  field shown in the HostBill admin service view. Populated by `Terminate()` when a grace
+  period is configured; empty for immediate terminations.
+- **`rateLimitExceeded()` private helper** — sliding-window session-based rate limit (60
+  req/min per service). Window resets after 60 s.
+- **`doCreate()` private helper** — extracted from `Create()` so the try/catch wrapper in
+  the public method is separate from the business logic.
+
+---
+
 ## v2.0.0 — 2026-06-09
 
 **BREAKING CHANGE — complete rebuild. v1.x used the Platform API (`/platform/v1`) to

@@ -52,7 +52,7 @@ class paneldns extends HostingModule
     protected $description = 'PanelDNS — Sub-client DNS Hosting (Reseller)';
 
     /** Module version — bump in lockstep with the repo release tag. */
-    protected $version = '2.0.0';
+    protected $version = '2.1.0';
 
     /**
      * Server fields shown in Settings → Apps when configuring the server.
@@ -111,6 +111,7 @@ class paneldns extends HostingModule
     /**
      * Per-account details stored by HostBill against each individual service.
      * option1 — PanelDNS Sub-client ID (set after Create; used by all hooks).
+     * option2 — Grace Period Deadline (YYYY-MM-DD; set by Terminate when grace > 0).
      */
     protected $details = [
         'option1' => [
@@ -118,6 +119,12 @@ class paneldns extends HostingModule
             'value'   => false,
             'type'    => 'input',
             'default' => false,
+        ],
+        'option2' => [
+            'name'    => 'Grace Period Deadline',
+            'value'   => '',
+            'type'    => 'input',
+            'default' => '',
         ],
     ];
 
@@ -211,6 +218,18 @@ class paneldns extends HostingModule
      */
     public function Create(): bool
     {
+        try {
+            return $this->doCreate();
+        } catch (\Throwable $e) {
+            // ERR-01: never surface stack traces or token values to the HostBill UI.
+            error_log('[paneldns-hostbill] Create exception: ' . get_class($e) . ': ' . $e->getMessage());
+            $this->addError('PanelDNS: unexpected error during provisioning — check server error log.');
+            return false;
+        }
+    }
+
+    private function doCreate(): bool
+    {
         if (!$this->api) {
             $this->addError('PanelDNS: server connection not initialised — check App configuration.');
             return false;
@@ -248,10 +267,15 @@ class paneldns extends HostingModule
         $legalResp    = $this->api->getResellerLegalVersion();
         $legalVersion = ($legalResp['ok'] ?? false) ? (string) ($legalResp['data']['version'] ?? '') : '';
 
+        // PASS-01: use the HostBill-provided service password if available (mirrors
+        // $params['password'] in the WHMCS module); otherwise generate a random one.
+        $servicePassword = trim((string) ($this->account_details['password'] ?? ''));
+        $password        = $servicePassword !== '' ? $servicePassword : bin2hex(random_bytes(12));
+
         $payload = [
             'name'               => $clientName,
             'email'              => $this->client_data['email'] ?? '',
-            'password'           => bin2hex(random_bytes(12)),
+            'password'           => $password,
             'zone_limit'         => $zoneLimit,
             'max_records'        => $maxRecords,
             'status'             => 'active',
@@ -297,25 +321,19 @@ class paneldns extends HostingModule
      */
     public function Suspend(): bool
     {
-        if (!$this->api) {
-            $this->addError('PanelDNS: server connection not initialised.');
+        try {
+            if (!$this->api) { $this->addError('PanelDNS: server connection not initialised.'); return false; }
+            $id = $this->subClientId();
+            if ($id <= 0) { $this->addError('PanelDNS: no Sub-client ID found — cannot suspend (was the service provisioned?).'); return false; }
+            $resp = $this->api->patchSubClient($id, ['status' => 'suspended']);
+            if (!$resp['ok']) { $this->addError('PanelDNS: suspend failed — see module activity log.'); return false; }
+            $this->addInfo("PanelDNS: sub-client #{$id} suspended.");
+            return true;
+        } catch (\Throwable $e) {
+            error_log('[paneldns-hostbill] Suspend exception: ' . get_class($e) . ': ' . $e->getMessage());
+            $this->addError('PanelDNS: unexpected error during suspend — check server error log.');
             return false;
         }
-
-        $id = $this->subClientId();
-        if ($id <= 0) {
-            $this->addError('PanelDNS: no Sub-client ID found — cannot suspend (was the service provisioned?).');
-            return false;
-        }
-
-        $resp = $this->api->patchSubClient($id, ['status' => 'suspended']);
-        if (!$resp['ok']) {
-            $this->addError('PanelDNS: suspend failed — see module activity log.');
-            return false;
-        }
-
-        $this->addInfo("PanelDNS: sub-client #{$id} suspended.");
-        return true;
     }
 
     /**
@@ -323,72 +341,72 @@ class paneldns extends HostingModule
      */
     public function Unsuspend(): bool
     {
-        if (!$this->api) {
-            $this->addError('PanelDNS: server connection not initialised.');
+        try {
+            if (!$this->api) { $this->addError('PanelDNS: server connection not initialised.'); return false; }
+            $id = $this->subClientId();
+            if ($id <= 0) { $this->addError('PanelDNS: no Sub-client ID found — cannot unsuspend.'); return false; }
+            $resp = $this->api->patchSubClient($id, ['status' => 'active']);
+            if (!$resp['ok']) { $this->addError('PanelDNS: unsuspend failed — see module activity log.'); return false; }
+            $this->addInfo("PanelDNS: sub-client #{$id} unsuspended.");
+            return true;
+        } catch (\Throwable $e) {
+            error_log('[paneldns-hostbill] Unsuspend exception: ' . get_class($e) . ': ' . $e->getMessage());
+            $this->addError('PanelDNS: unexpected error during unsuspend — check server error log.');
             return false;
         }
-
-        $id = $this->subClientId();
-        if ($id <= 0) {
-            $this->addError('PanelDNS: no Sub-client ID found — cannot unsuspend.');
-            return false;
-        }
-
-        $resp = $this->api->patchSubClient($id, ['status' => 'active']);
-        if (!$resp['ok']) {
-            $this->addError('PanelDNS: unsuspend failed — see module activity log.');
-            return false;
-        }
-
-        $this->addInfo("PanelDNS: sub-client #{$id} unsuspended.");
-        return true;
     }
 
     /**
      * Terminate (delete) the sub-client's PanelDNS account.
      *
      * GRACE-01: if option11 (Termination Grace Period) > 0, the sub-client is
-     * suspended now rather than deleted. HostBill does not have a built-in
-     * DailyCronJob equivalent — wire driftSync() into HostBill Task Scheduler
-     * to process expired grace periods nightly.
+     * suspended now rather than deleted. The deadline is stored in
+     * $this->details['option2']['value'] (visible in HostBill admin) so the
+     * HostBill Task Scheduler can identify and process expired grace accounts.
+     * Wire driftSync() into HostBill Task Scheduler to run nightly.
      */
     public function Terminate(): bool
     {
-        if (!$this->api) {
-            $this->addError('PanelDNS: server connection not initialised.');
-            return false;
-        }
+        try {
+            if (!$this->api) { $this->addError('PanelDNS: server connection not initialised.'); return false; }
 
-        $id = $this->subClientId();
-        if ($id <= 0) {
-            $this->addInfo('PanelDNS: no Sub-client ID to terminate (already deleted or never provisioned).');
-            return true;
-        }
-
-        // FIX-L4: clamp grace period to prevent absurdly large values.
-        $graceDays = min(365, max(0, (int) ($this->options['option11']['value'] ?? 0)));
-
-        if ($graceDays > 0) {
-            $resp = $this->api->patchSubClient($id, ['status' => 'suspended']);
-            if (!$resp['ok']) {
-                $this->addError('PanelDNS: grace-period suspend failed — see module activity log.');
-                return false;
+            $id = $this->subClientId();
+            if ($id <= 0) {
+                $this->addInfo('PanelDNS: no Sub-client ID to terminate (already deleted or never provisioned).');
+                return true;
             }
-            $deadline = date('Y-m-d', strtotime("+{$graceDays} days"));
-            $this->addInfo("PanelDNS: sub-client #{$id} suspended (grace period ends {$deadline}). "
-                . 'Wire driftSync() into HostBill Task Scheduler to delete after the deadline.');
-            return true;
-        }
 
-        $resp = $this->api->deleteSubClient($id);
-        if (!$resp['ok']) {
-            $this->addError('PanelDNS: terminate failed — see module activity log.');
+            // FIX-L4: clamp grace period to prevent absurdly large values.
+            $graceDays = min(365, max(0, (int) ($this->options['option11']['value'] ?? 0)));
+
+            if ($graceDays > 0) {
+                $resp = $this->api->patchSubClient($id, ['status' => 'suspended']);
+                if (!$resp['ok']) {
+                    $this->addError('PanelDNS: grace-period suspend failed — see module activity log.');
+                    return false;
+                }
+                $deadline = date('Y-m-d', strtotime("+{$graceDays} days"));
+                // GRACE-01: persist deadline in per-account details so Task Scheduler
+                // and admins can see when the account should be hard-deleted.
+                // Mirrors [paneldns-grace:{deadline}] written to tblhosting.notes in WHMCS.
+                $this->details['option2']['value'] = $deadline;
+                $this->addInfo("PanelDNS: sub-client #{$id} suspended. Grace period ends {$deadline} "
+                    . '(stored in Grace Period Deadline field). Wire driftSync() into Task Scheduler to delete after deadline.');
+                return true;
+            }
+
+            $resp = $this->api->deleteSubClient($id);
+            if (!$resp['ok']) { $this->addError('PanelDNS: terminate failed — see module activity log.'); return false; }
+
+            $this->details['option1']['value'] = '';
+            $this->details['option2']['value'] = '';
+            $this->addInfo("PanelDNS: sub-client #{$id} deleted.");
+            return true;
+        } catch (\Throwable $e) {
+            error_log('[paneldns-hostbill] Terminate exception: ' . get_class($e) . ': ' . $e->getMessage());
+            $this->addError('PanelDNS: unexpected error during termination — check server error log.');
             return false;
         }
-
-        $this->details['option1']['value'] = '';
-        $this->addInfo("PanelDNS: sub-client #{$id} deleted.");
-        return true;
     }
 
     /**
@@ -396,31 +414,28 @@ class paneldns extends HostingModule
      */
     public function ChangePackage(): bool
     {
-        if (!$this->api) {
-            $this->addError('PanelDNS: server connection not initialised.');
+        try {
+            if (!$this->api) { $this->addError('PanelDNS: server connection not initialised.'); return false; }
+
+            $id = $this->subClientId();
+            if ($id <= 0) { $this->addError('PanelDNS: no Sub-client ID — cannot change package.'); return false; }
+
+            $zoneLimit  = (int) ($this->options['option1']['value'] ?? 5);
+            $maxRecords = (int) ($this->options['option2']['value'] ?? 100);
+
+            $resp = $this->api->patchSubClient($id, [
+                'zone_limit'  => $zoneLimit,
+                'max_records' => $maxRecords,
+            ]);
+            if (!$resp['ok']) { $this->addError('PanelDNS: package change failed — see module activity log.'); return false; }
+
+            $this->addInfo("PanelDNS: sub-client #{$id} updated (zones: {$zoneLimit}, records/zone: {$maxRecords}).");
+            return true;
+        } catch (\Throwable $e) {
+            error_log('[paneldns-hostbill] ChangePackage exception: ' . get_class($e) . ': ' . $e->getMessage());
+            $this->addError('PanelDNS: unexpected error during package change — check server error log.');
             return false;
         }
-
-        $id = $this->subClientId();
-        if ($id <= 0) {
-            $this->addError('PanelDNS: no Sub-client ID — cannot change package.');
-            return false;
-        }
-
-        $zoneLimit  = (int) ($this->options['option1']['value'] ?? 5);
-        $maxRecords = (int) ($this->options['option2']['value'] ?? 100);
-
-        $resp = $this->api->patchSubClient($id, [
-            'zone_limit'  => $zoneLimit,
-            'max_records' => $maxRecords,
-        ]);
-        if (!$resp['ok']) {
-            $this->addError('PanelDNS: package change failed — see module activity log.');
-            return false;
-        }
-
-        $this->addInfo("PanelDNS: sub-client #{$id} updated (zones: {$zoneLimit}, records/zone: {$maxRecords}).");
-        return true;
     }
 
     // ── Admin buttons ─────────────────────────────────────────────────────────
@@ -517,6 +532,10 @@ class paneldns extends HostingModule
             || empty($resp['data']['login_url'])
             || !str_starts_with((string) ($resp['data']['login_url'] ?? ''), 'https://')
         ) {
+            // LOG-SSO-01: log SSO failures so admins can diagnose token minting errors
+            // without exposing details to the client. Mirrors logModuleCall() in WHMCS.
+            error_log('[paneldns-hostbill] ssoLogin failed for sub-client #' . $id
+                . ': ' . ($resp['error'] ?? 'invalid or missing login_url'));
             echo $this->h('PanelDNS: could not generate portal login link. Please try again or contact support.');
             exit();
         }
@@ -660,6 +679,13 @@ class paneldns extends HostingModule
 
         if ($this->subClientId() <= 0) {
             return '<div class="alert alert-info">Your DNS hosting account is being set up. Please check back shortly or contact support.</div>';
+        }
+
+        // RATE-01: rate-limit all client-area requests to 60 per minute per service.
+        // Uses a session counter since \WHMCS\Cache\Store is not available in HostBill.
+        // Mirrors the FIX-M6 rate limit in EmbeddedDnsManager::handle() in the WHMCS module.
+        if ($this->rateLimitExceeded()) {
+            return '<div class="alert alert-danger">Too many requests. Please wait a moment and try again.</div>';
         }
 
         // POST mutations take priority over GET page renders.
@@ -1150,7 +1176,10 @@ class paneldns extends HostingModule
         $count = $resp['data']['imported'] ?? '?';
         $this->rotateCsrf();
         $this->flash('success', "Imported {$count} records into the zone.");
-        return $this->renderZonesList();
+        // Redirect to the records page for the just-imported zone, matching WHMCS behaviour
+        // (EmbeddedDnsManager::doZoneImport() calls redirectTo('records', "&zone={$zoneId}")).
+        $_GET['zone'] = $zoneId;
+        return $this->renderRecords();
     }
 
     private function doZoneDelete(): string
@@ -1630,6 +1659,38 @@ class paneldns extends HostingModule
             $qs['pdns'] = $page;
         }
         return $base . ($qs ? '?' . http_build_query($qs) : '');
+    }
+
+    // ── Rate limiting ─────────────────────────────────────────────────────────
+
+    /**
+     * RATE-01: sliding-window rate limit, 60 requests per minute per service.
+     *
+     * Uses session counters since \WHMCS\Cache\Store is not available in HostBill.
+     * The window resets when more than 60 seconds have elapsed since the first hit.
+     * Mirrors FIX-M6 (EmbeddedDnsManager::handle()) in the WHMCS reseller module.
+     *
+     * NOTE: session-based counters are per-PHP-process, not shared across workers.
+     * For a shared-cache backend, replace with a HostBill cache API call when one
+     * becomes available.
+     */
+    private function rateLimitExceeded(): bool
+    {
+        if (session_status() === PHP_SESSION_NONE) { session_start(); }
+        $hitKey = 'paneldns_rl_' . $this->serviceId();
+        $tsKey  = 'paneldns_rl_ts_' . $this->serviceId();
+        $now    = time();
+
+        // Reset the window if more than 60 seconds have passed.
+        if (empty($_SESSION[$tsKey]) || ($now - (int) $_SESSION[$tsKey]) >= 60) {
+            $_SESSION[$tsKey] = $now;
+            $_SESSION[$hitKey] = 1;
+            return false;
+        }
+
+        $hits = (int) ($_SESSION[$hitKey] ?? 0) + 1;
+        $_SESSION[$hitKey] = $hits;
+        return $hits > 60;
     }
 
     // ── CSRF ─────────────────────────────────────────────────────────────────
