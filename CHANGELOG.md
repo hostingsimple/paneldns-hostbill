@@ -1,5 +1,111 @@
 # Changelog
 
+## v2.0.0 — 2026-06-09
+
+**BREAKING CHANGE — complete rebuild. v1.x used the Platform API (`/platform/v1`) to
+provision reseller orgs. v2.0.0 switches to the Reseller API (`/api/v1`) to provision
+sub-clients — matching `paneldns-reseller-whmcs` feature-for-feature.**
+
+### Migration from v1.x
+
+v1.x and v2.0.0 are incompatible at the server/product level:
+
+- v1.x required an **operator-level Platform API key**; v2.0.0 requires a **reseller-level
+  Sanctum Bearer token** (from the reseller's own PanelDNS dashboard → API Tokens).
+- v1.x stored a **PanelDNS Org ID** per service; v2.0.0 stores a **Sub-client ID**.
+- Product options have changed (plan_id → zone_limit + max_records).
+- Existing services provisioned by v1.x must be migrated manually: create matching
+  sub-clients via the PanelDNS reseller portal, then update the Sub-client ID in the
+  HostBill per-account detail field.
+
+### Changed
+
+- **API tier**: Platform (`/platform/v1`, operator key) → Reseller (`/api/v1`, Sanctum token).
+- **Entity**: Reseller orgs → Sub-clients. All lifecycle hooks now call `/api/v1/sub-clients`.
+- **Authentication**: operator Platform API key → per-reseller Sanctum Bearer token.
+- **Server field**: `hash` field labelled "Reseller API Key" (was "Platform API Key").
+- **Product options** completely redesigned to match `paneldns-reseller-whmcs` v1.7.2:
+  - option1: Zone Limit (was: PanelDNS Plan ID)
+  - option2: Max Records Per Zone (new)
+  - option3: Send Welcome Email (unchanged)
+  - option4–7: NS1–NS4 Hostname overrides (unchanged)
+  - option8: SOA Email (unchanged)
+  - option9: Auto-Create Zone on Domain Order (new)
+  - option10: Auto-Delete Zone on Domain Expiry (new; was Portal ToS URL)
+  - option11: Termination Grace Period (Days) (was option9)
+- **Per-account detail**: "PanelDNS Sub-client ID" (was "PanelDNS Org ID").
+- **`testConnection()`**: now calls `/api/v1/summary` instead of `/ping` + `/plans`, so
+  the token's reseller scopes are verified.
+- **`Create()`**: calls `POST /api/v1/sub-clients` with zone_limit, max_records, GDPR
+  consent stamping, and idempotent create (unsuspend if already provisioned).
+- **`Suspend()` / `Unsuspend()`**: `PATCH /api/v1/sub-clients/{id}` `{status: suspended/active}`
+  (was POST `.../suspend` and `.../unsuspend`).
+- **`Terminate()`**: `DELETE /api/v1/sub-clients/{id}` with configurable grace period.
+  Grace period suspends the account; documented to use HostBill Task Scheduler for cleanup.
+- **`ChangePackage()`**: `PATCH /api/v1/sub-clients/{id}` `{zone_limit, max_records}`
+  (was `PUT /platform/v1/orgs/{id}/plan`).
+- **`getUsage()`**: maps zones → disk, records → bandwidth (was zones → disk, sub_clients → bandwidth).
+- **`getServiceDetails()`**: now shows Sub-client ID, Sub-client Email, Zones used/limit and
+  Records used/limit with colour-coded progress bars, Last sync, and the first 20 zone names.
+- **`clientArea()`**: completely rewritten as a full embedded DNS manager (see Added below).
+- **`driftSync()`**: now accepts `['sub_client_id' => int, 'status' => string]` pairs
+  (was `['org_id' => int, 'status' => string]`).
+- **`ssoLogin()`**: now calls `POST /api/v1/sub-clients/{id}/sso-token`
+  (was `/platform/v1/orgs/{id}/sso-token`).
+- **`sendWelcomeEmail()`**: context updated to reseller sub-client (portal_url, org_slug,
+  nameservers, soa_email) matching the WHMCS reseller module's welcome email.
+- **`resendWelcome()`**: calls `mintSubClientSsoToken()` (was `mintOrgSsoToken()`).
+- **`resyncStatus()`**: calls `subClientSummary()` (was `orgSummary()`).
+- **`shared/PanelDnsApi.php`**: added `getResellerLegalVersion()`, `createSubClient()`,
+  `patchSubClient()`, `deleteSubClient()`, `subClientSummary()`, `mintSubClientSsoToken()`,
+  `searchSubClients()` reseller-tier helper methods.
+
+### Added
+
+- **Full embedded DNS manager in `clientArea()`** — matches `EmbeddedDnsManager` in
+  `paneldns-reseller-whmcs`. All pages return raw HTML (HostBill does not use Smarty):
+  - **Overview page**: usage cards (zones, records) with progress bars, nameservers widget,
+    zone health widget (surfaces non-active zones), SSO and Manage DNS Zones buttons.
+  - **Zones list**: table of all zones with status, record count, Manage/Export/Delete actions.
+  - **Records page**: full record table with inline edit form, Add Record form, and DNSSEC
+    panel (sign/unsigned toggle + DS records for registrar).
+  - **Zone create form**: name input with validation (≤253 chars, no `..`, alphanumeric
+    format), quota pre-flight check before API call.
+  - **Zone import form**: BIND text TEXTAREA for bulk zone import via `/api/v1/zones/import`.
+  - **Zone export (BIND)**: `?pdns=zone-export&zone=N` streams the zone as `text/plain` and
+    exits; ownership-checked before stream.
+  - **GDPR consent banner** (CONSENT-R-02): yellow warning with portal SSO link when
+    `sub_client.requires_consent` is true.
+  - **Suspension notice** rendered in overview when status is suspended.
+  - **CSRF protection**: per-service session token (`paneldns_csrf_{serviceId}`),
+    `bin2hex(random_bytes(24))`, rotated via `rotateCsrf()` after each successful mutation.
+    All POST forms include a `csrf` hidden field; `requireCsrf()` validates with `hash_equals()`.
+  - **Flash messages**: session key `paneldns_flash_{serviceId}`, capped at 512 chars;
+    shown at the top of the next page render.
+  - **Record validation**: 13-type allowlist (A, AAAA, CNAME, MX, TXT, NS, SRV, CAA, PTR,
+    TLSA, SSHFP, HTTPS, NAPTR), name ≤253 chars, content ≤4096 chars, TTL ≥60 s.
+  - **Zone validation**: name ≤253 chars, no consecutive dots, regex-validated format.
+  - **QUOTA-01 pre-flight**: checks zones_used vs zones_limit before `POST /api/v1/zones`.
+  - **Ownership check** (SEC-OWN): `fetchOwnZone()` verifies `sub_client_id` on every zone
+    action — never trusts a client-submitted zone ID alone.
+  - **DNSSEC**: `fetchDnssecStatus()` / `doDnssecToggle()` — null = provider unsupported.
+  - **Client SSO page**: `?pdns=sso` mints a token and uses a JS `window.location.href`
+    redirect (HostBill `clientArea()` returns HTML; `header()` redirect is not used).
+  - **NS-CARD-01**: nameservers "point your domain here" card shown at the top of the
+    records page.
+- **Progress bars** in `getServiceDetails()` and overview usage cards — colour-coded:
+  blue (< 75%), amber (75–90%), red (≥ 90%).
+- **`resolveNameservers()`**: prefers option4–7 product overrides; falls back to
+  `/api/v1/org/nameservers`.
+- **`cachedNameservers()`**: 5-minute in-process cache keyed by `identityHash()`.
+- **`cachedSubClientSummary()`**: 60-second in-process cache keyed by sub-client ID;
+  `resyncStatus()` and zone export bypass the cache.
+- **`isPrivateOrUnresolvable()`** SSRF guard: blocks connections to private, loopback,
+  link-local, and shared-address-space IPs at `connect()` time, in addition to the
+  `CURLOPT_IPRESOLVE_V4` + response-IP guard in `PanelDnsApiHb`.
+
+---
+
 ## v1.2.0 — 2026-06-09
 
 ### Added

@@ -1,33 +1,42 @@
 <?php
 
 /**
- * paneldns — HostBill server module for selling PanelDNS reseller accounts.
+ * paneldns — HostBill server module for selling PanelDNS sub-client DNS hosting.
  *
- * Drives the operator-tier Platform API (/platform/v1). Used by an operator
- * running PanelDNS-as-a-SaaS to onboard new resellers via their HostBill:
+ * v2.0.0 — reseller-tier Reseller API (/api/v1). Provisions sub-clients.
  *
- *   - HostBill Create        → POST /platform/v1/orgs
- *   - HostBill Suspend       → POST /platform/v1/orgs/{id}/suspend
- *   - HostBill Unsuspend     → POST /platform/v1/orgs/{id}/unsuspend
- *   - HostBill Terminate     → DELETE /platform/v1/orgs/{id}
- *   - HostBill ChangePackage → PUT /platform/v1/orgs/{id}/plan
+ * UPGRADE NOTE: v1.x used the Platform API (/platform/v1) to provision
+ * reseller orgs. v2.0.0 is a BREAKING rebuild to the reseller tier so
+ * this module matches paneldns-reseller-whmcs feature-for-feature.
  *
- * See ../../../shared/PanelDnsApi.php for the HTTP client.
- * See README.md in the repo root for installation and configuration.
+ * Drives the reseller-tier API (/api/v1). Used by a reseller who has a
+ * PanelDNS org and wants to sell DNS hosting to their own customers via
+ * HostBill:
  *
- * File naming: class.paneldns.php in
- *   includes/modules/Hosting/paneldns/
+ *   - HostBill Create        → POST /api/v1/sub-clients
+ *   - HostBill Suspend       → PATCH /api/v1/sub-clients/{id} {status: suspended}
+ *   - HostBill Unsuspend     → PATCH /api/v1/sub-clients/{id} {status: active}
+ *   - HostBill Terminate     → DELETE /api/v1/sub-clients/{id}
+ *   - HostBill ChangePackage → PATCH /api/v1/sub-clients/{id} {zone_limit, max_records}
+ *   - Client SSO             → POST /api/v1/sub-clients/{id}/sso-token → 302 redirect
+ *
+ * Authentication: a per-user Sanctum Bearer token issued by the reseller's
+ * PanelDNS dashboard (Dashboard → API Tokens). Scopes required:
+ * sub_clients:write, sub_clients:read.
  *
  * HostBill conventions:
  *   - Class name MUST match the file name (without class. prefix and .php).
  *   - Extends HostingModule (HostBill base class for provisioning modules).
  *   - connect($connect) is called before every lifecycle method.
- *   - Return true/false from lifecycle methods; call $this->addError() for failures,
- *     $this->addInfo() for success messages.
- *   - $this->client_data   — client details (email, firstname, lastname, id, ...).
- *   - $this->account_details — service/account details (id, server_id, ...).
- *   - $this->options       — product-level configuration (same key for all accounts).
+ *   - Return true/false from lifecycle methods; call $this->addError() for
+ *     failures, $this->addInfo() for success messages.
+ *   - $this->client_data   — client details (email, firstname, lastname, …).
+ *   - $this->account_details — service/account details (id, server_id, …).
+ *   - $this->options       — product-level configuration (shared across all
+ *     accounts on the same product).
  *   - $this->details       — per-account data (stored per service).
+ *
+ * File: includes/modules/Hosting/paneldns/class.paneldns.php
  *
  * @package paneldns-hostbill
  */
@@ -40,16 +49,16 @@ require_once __DIR__ . '/../../../shared/LicenceCheck.php';
 class paneldns extends HostingModule
 {
     /** Displayed in HostBill admin when choosing a module. */
-    protected $description = 'PanelDNS — Reseller DNS Management Platform';
+    protected $description = 'PanelDNS — Sub-client DNS Hosting (Reseller)';
 
     /** Module version — bump in lockstep with the repo release tag. */
-    protected $version = '1.2.0';
+    protected $version = '2.0.0';
 
     /**
-     * Server fields shown in Settings -> Apps when configuring the server.
-     * 'hostname' maps to the PanelDNS base URL (e.g. https://my.paneldns.io).
-     * 'hash'     holds the Platform API key (Bearer token).
-     * 'ssl'      enables/disables TLS verification (keep ON in production).
+     * Server fields shown in Settings → Apps when configuring the server.
+     * 'hostname' = PanelDNS base URL (e.g. https://my.paneldns.io).
+     * 'hash'     = Reseller API key (Sanctum Bearer token).
+     * 'ssl'      = TLS certificate verification (keep ON in production).
      */
     protected $serverFields = [
         'hostname'    => true,
@@ -63,12 +72,9 @@ class paneldns extends HostingModule
         'nameservers' => false,
     ];
 
-    /**
-     * Human-readable labels for the server fields above (replaces HostBill defaults).
-     */
     protected $serverFieldsDescription = [
         'hostname' => 'PanelDNS Base URL (e.g. https://my.paneldns.io)',
-        'hash'     => 'Platform API Key',
+        'hash'     => 'Reseller API Key (Sanctum Bearer token from PanelDNS dashboard → API Tokens)',
         'ssl'      => 'Verify TLS Certificate (recommended: ON)',
     ];
 
@@ -76,93 +82,39 @@ class paneldns extends HostingModule
      * Product-level configuration options.
      * These values are the same for all accounts created from a given product.
      *
-     * option1 — PanelDNS Plan ID (numeric ID from /admin/plans on your PanelDNS).
-     * option2 — Partner Source (optional; marks the org as a partner plan).
-     * option3 — Send Welcome Email (yes/no checkbox).
-     * option4 — NS1 Hostname (optional vanity nameserver).
-     * option5 — NS2 Hostname.
-     * option6 — NS3 Hostname.
-     * option7 — NS4 Hostname.
-     * option8 — SOA Email.
-     * option9 — Termination Grace Period (days; 0 = immediate delete).
+     * option1  — Zone Limit (0 = inherit org plan limit)
+     * option2  — Max Records Per Zone (0 = inherit org plan limit)
+     * option3  — Send Welcome Email on Create (yes/no)
+     * option4  — NS1 Hostname override (shown in welcome email / client area)
+     * option5  — NS2 Hostname override
+     * option6  — NS3 Hostname override
+     * option7  — NS4 Hostname override
+     * option8  — SOA Email (shown in welcome email)
+     * option9  — Auto-Create Zone on Domain Order (yes/no)
+     * option10 — Auto-Delete Zone on Domain Expiry (yes/no)
+     * option11 — Termination Grace Period (days; 0 = delete immediately)
      */
     protected $options = [
-        'option1' => [
-            'name'    => 'PanelDNS Plan ID',
-            'value'   => '',
-            'type'    => 'input',
-            'default' => '',
-        ],
-        'option2' => [
-            'name'    => 'Partner Source',
-            'value'   => '',
-            'type'    => 'input',
-            'default' => '',
-        ],
-        'option3' => [
-            'name'    => 'Send Welcome Email',
-            'value'   => '1',
-            'type'    => 'check',
-            'default' => '',
-        ],
-        'option4' => [
-            'name'    => 'NS1 Hostname',
-            'value'   => '',
-            'type'    => 'input',
-            'default' => '',
-        ],
-        'option5' => [
-            'name'    => 'NS2 Hostname',
-            'value'   => '',
-            'type'    => 'input',
-            'default' => '',
-        ],
-        'option6' => [
-            'name'    => 'NS3 Hostname',
-            'value'   => '',
-            'type'    => 'input',
-            'default' => '',
-        ],
-        'option7' => [
-            'name'    => 'NS4 Hostname',
-            'value'   => '',
-            'type'    => 'input',
-            'default' => '',
-        ],
-        'option8' => [
-            'name'    => 'SOA Email',
-            'value'   => '',
-            'type'    => 'input',
-            'default' => '',
-        ],
-        'option9' => [
-            'name'    => 'Termination Grace Period (Days)',
-            'value'   => '0',
-            'type'    => 'input',
-            'default' => '0',
-        ],
-        'option10' => [
-            'name'    => 'Portal Terms of Service URL',
-            'value'   => '',
-            'type'    => 'input',
-            'default' => '',
-        ],
-        'option11' => [
-            'name'    => 'Portal Privacy Policy URL',
-            'value'   => '',
-            'type'    => 'input',
-            'default' => '',
-        ],
+        'option1'  => ['name' => 'Zone Limit',                        'value' => '5',   'type' => 'input', 'default' => '5'],
+        'option2'  => ['name' => 'Max Records Per Zone',               'value' => '100', 'type' => 'input', 'default' => '100'],
+        'option3'  => ['name' => 'Send Welcome Email',                 'value' => '1',   'type' => 'check', 'default' => '1'],
+        'option4'  => ['name' => 'NS1 Hostname',                       'value' => '',    'type' => 'input', 'default' => ''],
+        'option5'  => ['name' => 'NS2 Hostname',                       'value' => '',    'type' => 'input', 'default' => ''],
+        'option6'  => ['name' => 'NS3 Hostname',                       'value' => '',    'type' => 'input', 'default' => ''],
+        'option7'  => ['name' => 'NS4 Hostname',                       'value' => '',    'type' => 'input', 'default' => ''],
+        'option8'  => ['name' => 'SOA Email',                          'value' => '',    'type' => 'input', 'default' => ''],
+        'option9'  => ['name' => 'Auto-Create Zone on Domain Order',   'value' => '1',   'type' => 'check', 'default' => '1'],
+        'option10' => ['name' => 'Auto-Delete Zone on Domain Expiry',  'value' => '0',   'type' => 'check', 'default' => '0'],
+        'option11' => ['name' => 'Termination Grace Period (Days)',     'value' => '0',   'type' => 'input', 'default' => '0'],
     ];
 
     /**
      * Per-account details stored by HostBill against each individual service.
-     *
-     * option1 — PanelDNS Org ID (set after Create succeeds; used by all other hooks).
+     * option1 — PanelDNS Sub-client ID (set after Create; used by all hooks).
      */
     protected $details = [
         'option1' => [
-            'name'    => 'PanelDNS Org ID',
+            'name'    => 'PanelDNS Sub-client ID',
             'value'   => false,
             'type'    => 'input',
             'default' => false,
@@ -171,7 +123,7 @@ class paneldns extends HostingModule
 
     /**
      * Custom admin buttons shown on the service detail page.
-     * HostBill calls the named method on this class when the button is clicked.
+     * HostBill calls the named method on this class when clicked.
      */
     protected $buttons = [
         'Resend Welcome Email' => 'resendWelcome',
@@ -183,23 +135,31 @@ class paneldns extends HostingModule
     /** @var PanelDnsApiHb|null */ private $api = null;
 
     /**
-     * CACHE-01: 60-second in-process summary cache keyed by org ID.
-     * Prevents repeated orgSummary() API calls when HostBill renders the admin
-     * service detail panel, client area, and usage graphs in the same request.
+     * CACHE-01: 60-second in-process summary cache keyed by sub-client ID.
+     * Prevents repeated subClientSummary() API calls when HostBill renders
+     * the admin detail panel, client area, and usage graphs in the same request.
      *
      * @var array<int, array{ts: int, resp: array}>
      */
     private static array $summaryCache = [];
 
+    /**
+     * CACHE-02: 5-minute in-process nameserver cache keyed by identity hash.
+     * Prevents repeated /api/v1/org/nameservers calls within one request.
+     *
+     * @var array<string, array{ts: int, ns: string[]}>
+     */
+    private static array $nsCache = [];
+
     // ── HostBill lifecycle ────────────────────────────────────────────────────
 
     /**
-     * Called by HostBill before every other method. Receives the server app
-     * configuration from Settings -> Apps.
+     * Called by HostBill before every other method.
+     * Receives the server app configuration from Settings → Apps.
      *
      * @param array $connect {
      *   'hostname' string  PanelDNS base URL
-     *   'hash'     string  Platform API key
+     *   'hash'     string  Reseller API key (Sanctum Bearer token)
      *   'secure'   int     1 = verify TLS, 0 = skip
      * }
      */
@@ -214,24 +174,16 @@ class paneldns extends HostingModule
         if ($host !== null && $host !== false) {
             $resolved = gethostbyname($host);
             if (self::isPrivateOrUnresolvable($resolved, $host)) {
-                // Store null api so every lifecycle method fails gracefully.
                 $this->api = null;
                 return;
             }
         }
 
-        $logger = function (string $action, array $request, mixed $response): void {
-            // HostBill does not have a logModuleCall equivalent; use the built-in
-            // activity logger if available, otherwise silently skip.
-            // Module-level logging can be added here for enterprise deployments.
-        };
-
-        $this->api = new PanelDnsApiHb($baseUrl, $apiKey, PanelDnsApiHb::MODE_PLATFORM, $tlsVerify, $logger);
+        $this->api = new PanelDnsApiHb($baseUrl, $apiKey, PanelDnsApiHb::MODE_RESELLER, $tlsVerify);
     }
 
     /**
      * Called when admin clicks "Test Connection" on the App configuration page.
-     * @return bool true on success.
      */
     public function testConnection(): bool
     {
@@ -240,15 +192,10 @@ class paneldns extends HostingModule
             return false;
         }
 
-        $ping = $this->api->ping();
-        if (!$ping['ok']) {
-            $this->addError('PanelDNS: server unreachable — check the Base URL.');
-            return false;
-        }
-
-        $plans = $this->api->plans();
-        if (!$plans['ok']) {
-            $this->addError('PanelDNS: authentication failed — check the Platform API Key.');
+        // Use /api/v1/summary rather than /ping so the token scopes are verified.
+        $resp = $this->api->summary();
+        if (!$resp['ok']) {
+            $this->addError('PanelDNS: authentication failed — check the Reseller API Key.');
             return false;
         }
 
@@ -257,9 +204,9 @@ class paneldns extends HostingModule
     }
 
     /**
-     * Create a new PanelDNS reseller org for this service.
+     * Create a new PanelDNS sub-client for this service.
      *
-     * On success: sets $this->details['option1']['value'] to the new org ID.
+     * On success: sets $this->details['option1']['value'] to the new sub-client ID.
      * Returns true so HostBill marks the service Active.
      */
     public function Create(): bool
@@ -269,116 +216,84 @@ class paneldns extends HostingModule
             return false;
         }
 
-        // Licence gate — only platform module required for operators who self-host PanelDNS.
-        // Comment this out if you ship this module to operators who do NOT need a licence check.
-        // $error = PanelDnsLicenceCheckHb::gateOrError($this->api, PanelDnsLicenceCheckHb::REQUIRED_MODULE_PLATFORM);
-        // if ($error !== null) { $this->addError($error); return false; }
+        // Licence gate — enable when shipping as a paid module.
+        // if ($err = PanelDnsLicenceCheckHb::gateOrError($this->api, 'reseller')) {
+        //     $this->addError($err); return false;
+        // }
 
-        // Idempotency: if we already provisioned this service, just unsuspend.
-        $existingId = $this->orgId();
-        if ($existingId > 0) {
-            $resp = $this->api->unsuspendOrg($existingId);
+        // Idempotency: if already provisioned, just unsuspend.
+        $existing = $this->subClientId();
+        if ($existing > 0) {
+            $resp = $this->api->patchSubClient($existing, ['status' => 'active']);
             if ($resp['ok']) {
-                $this->addInfo('PanelDNS: org unsuspended (idempotent create).');
+                $this->addInfo("PanelDNS: sub-client #{$existing} unsuspended (idempotent create).");
                 return true;
             }
             $this->addError('PanelDNS: unsuspend failed — see module activity log.');
             return false;
         }
 
-        $planId = (int) ($this->options['option1']['value'] ?? 0);
-        if ($planId <= 0) {
-            $this->addError('PanelDNS: Plan ID is required. Set it in the product module settings (option1).');
-            return false;
+        $clientName = trim(
+            (($this->client_data['firstname'] ?? '') . ' ' . ($this->client_data['lastname'] ?? ''))
+        );
+        if ($clientName === '') {
+            $clientName = $this->client_data['email'] ?? 'unknown';
         }
 
-        $clientEmail     = $this->client_data['email']     ?? '';
-        $clientFirstname = $this->client_data['firstname'] ?? '';
-        $clientLastname  = $this->client_data['lastname']  ?? '';
-        $clientCompany   = $this->client_data['company']   ?? '';
+        $zoneLimit  = (int) ($this->options['option1']['value'] ?? 5);
+        $maxRecords = (int) ($this->options['option2']['value'] ?? 100);
 
-        $orgName = $clientCompany ?: trim("{$clientFirstname} {$clientLastname}") ?: $clientEmail;
+        // GDPR-LEGAL-01: stamp legal consent at provisioning time so the
+        // sub-client account is covered from creation (actor_type=reseller_api).
+        $legalResp    = $this->api->getResellerLegalVersion();
+        $legalVersion = ($legalResp['ok'] ?? false) ? (string) ($legalResp['data']['version'] ?? '') : '';
 
-        $payload = array_filter([
-            'name'           => $orgName,
-            'plan_id'        => $planId,
-            'partner_source' => trim((string) ($this->options['option2']['value'] ?? '')) ?: null,
-            'ns1_hostname'   => trim((string) ($this->options['option4']['value'] ?? '')) ?: null,
-            'ns2_hostname'   => trim((string) ($this->options['option5']['value'] ?? '')) ?: null,
-            'ns3_hostname'   => trim((string) ($this->options['option6']['value'] ?? '')) ?: null,
-            'ns4_hostname'   => trim((string) ($this->options['option7']['value'] ?? '')) ?: null,
-            'soa_email'      => trim((string) ($this->options['option8']['value'] ?? '')) ?: null,
-            'owner' => [
-                'name'     => trim("{$clientFirstname} {$clientLastname}") ?: $clientEmail,
-                'email'    => $clientEmail,
-                'password' => bin2hex(random_bytes(12)),
-            ],
-        ], fn ($v) => $v !== null);
-
-        // Convey legal consent: HostBill order forms include a mandatory "agree to
-        // terms" step — pass acknowledgement through so the owner account is marked
-        // as consented immediately (actor_type=reseller_api).
-        $legalVersion = $this->fetchLegalVersion();
-        if ($legalVersion !== null) {
-            $payload['terms_acknowledged'] = true;
-            $payload['terms_version']      = $legalVersion;
+        $payload = [
+            'name'               => $clientName,
+            'email'              => $this->client_data['email'] ?? '',
+            'password'           => bin2hex(random_bytes(12)),
+            'zone_limit'         => $zoneLimit,
+            'max_records'        => $maxRecords,
+            'status'             => 'active',
+            'terms_acknowledged' => true,
+        ];
+        if ($legalVersion !== '') {
+            $payload['terms_version'] = $legalVersion;
         }
 
-        $resp = $this->api->createOrg($payload);
+        $resp = $this->api->createSubClient($payload);
         if (!$resp['ok']) {
-            $this->addError('PanelDNS: org creation failed — see module activity log.');
+            $this->addError('PanelDNS: sub-client creation failed — see module activity log.');
             return false;
         }
 
         $newId = (int) ($resp['data']['id'] ?? 0);
         if ($newId <= 0) {
-            $this->addError('PanelDNS: org created but no ID returned.');
+            $this->addError('PanelDNS: sub-client created but no ID returned.');
             return false;
         }
 
-        // Persist org ID in per-account details so all future hooks can find it.
+        // Persist sub-client ID in per-account details so all future hooks can find it.
         $this->details['option1']['value'] = (string) $newId;
 
-        // GDPR-LEGAL-01: if option10/11 (portal ToS/Privacy URLs) are set, PATCH them
-        // onto the new org so sub-client invitations can reference them immediately.
-        // Non-fatal — provisioning has already succeeded at this point.
-        $portalTermsUrl   = trim((string) ($this->options['option10']['value'] ?? ''));
-        $portalPrivacyUrl = trim((string) ($this->options['option11']['value'] ?? ''));
-        if ($portalTermsUrl || $portalPrivacyUrl) {
-            $patch = array_filter([
-                'portal_terms_url'   => $portalTermsUrl   ?: null,
-                'portal_privacy_url' => $portalPrivacyUrl ?: null,
-            ]);
-            $this->api->patchOrg($newId, $patch); // non-fatal
+        // NS-NOTES-01: surface assigned nameservers to admin via addInfo() so
+        // support staff can tell the client where to point their domain without
+        // opening PanelDNS. Mirrors WHMCS writeNameserversToServiceNotes().
+        $ns = $this->resolveNameservers();
+        if (!empty($ns)) {
+            $this->addInfo('PanelDNS nameservers: ' . implode(', ', $ns));
         }
 
-        // NS-NOTES-01: fetch the org's assigned nameservers and surface them to the
-        // admin via addInfo() so support staff don't need to open PanelDNS to find
-        // the NS to give the client. Mirrors WHMCS writeNameserversToServiceNotes().
-        $orgData = $this->api->getOrg($newId);
-        if ($orgData['ok']) {
-            $ns = array_values(array_filter([
-                $orgData['data']['ns1_hostname'] ?? null,
-                $orgData['data']['ns2_hostname'] ?? null,
-                $orgData['data']['ns3_hostname'] ?? null,
-                $orgData['data']['ns4_hostname'] ?? null,
-            ], fn ($v) => is_string($v) && $v !== ''));
-            if (!empty($ns)) {
-                $this->addInfo('PanelDNS nameservers: ' . implode(', ', $ns));
-            }
-        }
-
-        // Optionally send welcome email with SSO link.
         if (!empty($this->options['option3']['value'])) {
-            $this->sendWelcomeEmail($newId, $clientEmail);
+            $this->sendWelcomeEmail($newId);
         }
 
-        $this->addInfo("PanelDNS: org #{$newId} created successfully.");
+        $this->addInfo("PanelDNS: sub-client #{$newId} created successfully.");
         return true;
     }
 
     /**
-     * Suspend the reseller's PanelDNS org (e.g. overdue invoice).
+     * Suspend the sub-client's PanelDNS account (e.g. overdue invoice).
      */
     public function Suspend(): bool
     {
@@ -387,24 +302,24 @@ class paneldns extends HostingModule
             return false;
         }
 
-        $id = $this->orgId();
+        $id = $this->subClientId();
         if ($id <= 0) {
-            $this->addError('PanelDNS: no Org ID found — cannot suspend (was the service provisioned?).');
+            $this->addError('PanelDNS: no Sub-client ID found — cannot suspend (was the service provisioned?).');
             return false;
         }
 
-        $resp = $this->api->suspendOrg($id);
+        $resp = $this->api->patchSubClient($id, ['status' => 'suspended']);
         if (!$resp['ok']) {
             $this->addError('PanelDNS: suspend failed — see module activity log.');
             return false;
         }
 
-        $this->addInfo("PanelDNS: org #{$id} suspended.");
+        $this->addInfo("PanelDNS: sub-client #{$id} suspended.");
         return true;
     }
 
     /**
-     * Unsuspend the reseller's PanelDNS org (e.g. invoice paid).
+     * Unsuspend the sub-client's PanelDNS account (e.g. invoice paid).
      */
     public function Unsuspend(): bool
     {
@@ -413,29 +328,29 @@ class paneldns extends HostingModule
             return false;
         }
 
-        $id = $this->orgId();
+        $id = $this->subClientId();
         if ($id <= 0) {
-            $this->addError('PanelDNS: no Org ID found — cannot unsuspend.');
+            $this->addError('PanelDNS: no Sub-client ID found — cannot unsuspend.');
             return false;
         }
 
-        $resp = $this->api->unsuspendOrg($id);
+        $resp = $this->api->patchSubClient($id, ['status' => 'active']);
         if (!$resp['ok']) {
             $this->addError('PanelDNS: unsuspend failed — see module activity log.');
             return false;
         }
 
-        $this->addInfo("PanelDNS: org #{$id} unsuspended.");
+        $this->addInfo("PanelDNS: sub-client #{$id} unsuspended.");
         return true;
     }
 
     /**
-     * Terminate (delete) the reseller's PanelDNS org.
+     * Terminate (delete) the sub-client's PanelDNS account.
      *
-     * If option9 (Termination Grace Period) is > 0, the org is suspended now
-     * and a note is written. A separate cron/script would need to handle deletion
-     * after the grace period — HostBill does not have a built-in deferred delete
-     * mechanism like WHMCS DailyCronJob hooks.
+     * GRACE-01: if option11 (Termination Grace Period) > 0, the sub-client is
+     * suspended now rather than deleted. HostBill does not have a built-in
+     * DailyCronJob equivalent — wire driftSync() into HostBill Task Scheduler
+     * to process expired grace periods nightly.
      */
     public function Terminate(): bool
     {
@@ -444,41 +359,40 @@ class paneldns extends HostingModule
             return false;
         }
 
-        $id = $this->orgId();
+        $id = $this->subClientId();
         if ($id <= 0) {
-            // Nothing to delete — already gone or never provisioned.
-            $this->addInfo('PanelDNS: no Org ID to terminate (already deleted or never provisioned).');
+            $this->addInfo('PanelDNS: no Sub-client ID to terminate (already deleted or never provisioned).');
             return true;
         }
 
-        $graceDays = (int) ($this->options['option9']['value'] ?? 0);
+        // FIX-L4: clamp grace period to prevent absurdly large values.
+        $graceDays = min(365, max(0, (int) ($this->options['option11']['value'] ?? 0)));
 
         if ($graceDays > 0) {
-            // Suspend now; store grace-period deadline note.
-            $resp = $this->api->suspendOrg($id);
+            $resp = $this->api->patchSubClient($id, ['status' => 'suspended']);
             if (!$resp['ok']) {
                 $this->addError('PanelDNS: grace-period suspend failed — see module activity log.');
                 return false;
             }
             $deadline = date('Y-m-d', strtotime("+{$graceDays} days"));
-            $this->addInfo("PanelDNS: org #{$id} suspended (grace period ends {$deadline}).");
+            $this->addInfo("PanelDNS: sub-client #{$id} suspended (grace period ends {$deadline}). "
+                . 'Wire driftSync() into HostBill Task Scheduler to delete after the deadline.');
             return true;
         }
 
-        $resp = $this->api->terminateOrg($id);
+        $resp = $this->api->deleteSubClient($id);
         if (!$resp['ok']) {
             $this->addError('PanelDNS: terminate failed — see module activity log.');
             return false;
         }
 
         $this->details['option1']['value'] = '';
-        $this->addInfo("PanelDNS: org #{$id} deleted.");
+        $this->addInfo("PanelDNS: sub-client #{$id} deleted.");
         return true;
     }
 
     /**
-     * Upgrade or downgrade the plan assigned to this org.
-     * Called by HostBill when a client upgrades/downgrades their product.
+     * Upgrade or downgrade the zone/record limits for this sub-client.
      */
     public function ChangePackage(): bool
     {
@@ -487,60 +401,33 @@ class paneldns extends HostingModule
             return false;
         }
 
-        $id = $this->orgId();
+        $id = $this->subClientId();
         if ($id <= 0) {
-            $this->addError('PanelDNS: no Org ID — cannot change package.');
+            $this->addError('PanelDNS: no Sub-client ID — cannot change package.');
             return false;
         }
 
-        $planId = (int) ($this->options['option1']['value'] ?? 0);
-        if ($planId <= 0) {
-            $this->addError('PanelDNS: Plan ID missing on new product configuration.');
-            return false;
-        }
+        $zoneLimit  = (int) ($this->options['option1']['value'] ?? 5);
+        $maxRecords = (int) ($this->options['option2']['value'] ?? 100);
 
-        $resp = $this->api->changePlan($id, $planId);
+        $resp = $this->api->patchSubClient($id, [
+            'zone_limit'  => $zoneLimit,
+            'max_records' => $maxRecords,
+        ]);
         if (!$resp['ok']) {
-            $this->addError('PanelDNS: plan change failed — see module activity log.');
+            $this->addError('PanelDNS: package change failed — see module activity log.');
             return false;
         }
 
-        $this->addInfo("PanelDNS: org #{$id} moved to plan #{$planId}.");
+        $this->addInfo("PanelDNS: sub-client #{$id} updated (zones: {$zoneLimit}, records/zone: {$maxRecords}).");
         return true;
-    }
-
-    /**
-     * Loadable field helper — returns available plans for the option1 dropdown.
-     * HostBill calls this when rendering the product module settings page because
-     * option1 is set to type='loadable' with default='getPlans'.
-     *
-     * Returns an array of [plan_id, plan_name] pairs or false on failure.
-     */
-    public function getPlans(): array|bool
-    {
-        if (!$this->api) return false;
-
-        $resp = $this->api->plans();
-        if (!$resp['ok'] || !is_array($resp['data'])) return false;
-
-        $plans = [];
-        foreach ((array) $resp['data'] as $plan) {
-            $id   = $plan['id']   ?? null;
-            $name = $plan['name'] ?? null;
-            if ($id !== null && $name !== null) {
-                $plans[] = [(string) $id, (string) $name];
-            }
-        }
-        return empty($plans) ? false : $plans;
     }
 
     // ── Admin buttons ─────────────────────────────────────────────────────────
 
     /**
-     * Re-mint a one-time SSO login URL and send the welcome email again.
+     * Re-mint a one-time SSO login URL and resend the welcome email.
      * Shown as an admin button ("Resend Welcome Email") on the service page.
-     *
-     * @return bool true on success; calls $this->addError() on failure.
      */
     public function resendWelcome(): bool
     {
@@ -549,16 +436,13 @@ class paneldns extends HostingModule
             return false;
         }
 
-        $id = $this->orgId();
+        $id = $this->subClientId();
         if ($id <= 0) {
             $this->addError('PanelDNS: service not provisioned — cannot send welcome email.');
             return false;
         }
 
-        $clientEmail = $this->client_data['email'] ?? '';
-        $sso = $this->api->mintOrgSsoToken($id, $clientEmail ?: null);
-
-        // SEC: validate returned URL scheme — prevents javascript:/data: injection.
+        $sso = $this->api->mintSubClientSsoToken($id);
         if (
             !$sso['ok']
             || empty($sso['data']['login_url'])
@@ -568,16 +452,16 @@ class paneldns extends HostingModule
             return false;
         }
 
-        $this->sendWelcomeEmail($id, $clientEmail);
-        $this->addInfo("PanelDNS: welcome email resent to {$clientEmail}.");
+        $this->sendWelcomeEmail($id);
+        $email = $this->client_data['email'] ?? '';
+        $this->addInfo("PanelDNS: welcome email resent to {$email}.");
         return true;
     }
 
     /**
-     * Fetch live org summary and surface key metrics as an info message.
+     * Fetch live sub-client summary and surface key metrics as an info message.
      * Shown as an admin button ("Resync Status") on the service page.
-     *
-     * @return bool true on success; calls $this->addError() on failure.
+     * Bypasses the 60-second cache so the result is always live.
      */
     public function resyncStatus(): bool
     {
@@ -586,21 +470,23 @@ class paneldns extends HostingModule
             return false;
         }
 
-        $id = $this->orgId();
+        $id = $this->subClientId();
         if ($id <= 0) {
-            $this->addError('PanelDNS: no Org ID found — cannot resync.');
+            $this->addError('PanelDNS: no Sub-client ID found — cannot resync.');
             return false;
         }
 
-        $resp = $this->api->orgSummary($id);
+        $resp = $this->api->subClientSummary($id);
         if (!$resp['ok']) {
             $this->addError('PanelDNS: resync failed — see module activity log.');
             return false;
         }
 
-        $zones   = (int) ($resp['data']['usage']['active_zones'] ?? 0);
-        $clients = (int) ($resp['data']['usage']['sub_clients']  ?? 0);
-        $this->addInfo("PanelDNS: org #{$id} — {$zones} zones, {$clients} sub-clients.");
+        $usage  = $resp['data']['usage']  ?? [];
+        $limits = $resp['data']['limits'] ?? [];
+        $zones  = (int) ($usage['zones']   ?? 0);
+        $recs   = (int) ($usage['records'] ?? 0);
+        $this->addInfo("PanelDNS: sub-client #{$id} — {$zones} zones, {$recs} records.");
         return true;
     }
 
@@ -608,31 +494,30 @@ class paneldns extends HostingModule
 
     /**
      * Called by HostBill when the client clicks the SSO login link.
-     * Mints an SSO token, validates the returned URL, then redirects.
+     * Mints a 60-second SSO token, validates the returned URL, then redirects.
      */
     public function ssoLogin(): void
     {
         if (!$this->api) {
-            echo htmlspecialchars('PanelDNS: server connection not initialised.', ENT_QUOTES, 'UTF-8');
+            echo $this->h('PanelDNS: server connection not initialised.');
             exit();
         }
 
-        $id = $this->orgId();
+        $id = $this->subClientId();
         if ($id <= 0) {
-            echo htmlspecialchars('PanelDNS: service not provisioned.', ENT_QUOTES, 'UTF-8');
+            echo $this->h('PanelDNS: service not provisioned.');
             exit();
         }
 
-        $clientEmail = $this->client_data['email'] ?? '';
-        $resp = $this->api->mintOrgSsoToken($id, $clientEmail ?: null);
+        $resp = $this->api->mintSubClientSsoToken($id);
 
-        // SEC: validate scheme — prevents javascript:/data: redirect injection.
+        // SEC: validate returned URL scheme — prevents javascript:/data: injection.
         if (
             !$resp['ok']
             || empty($resp['data']['login_url'])
             || !str_starts_with((string) ($resp['data']['login_url'] ?? ''), 'https://')
         ) {
-            echo htmlspecialchars('PanelDNS: could not generate portal login link. Please try again or contact support.', ENT_QUOTES, 'UTF-8');
+            echo $this->h('PanelDNS: could not generate portal login link. Please try again or contact support.');
             exit();
         }
 
@@ -645,9 +530,9 @@ class paneldns extends HostingModule
 
     /**
      * Called by HostBill to populate usage graphs.
-     * Maps active_zones → disk and sub_clients → bandwidth.
+     * Maps zones → disk and records → bandwidth (standard DNS module pattern).
      *
-     * @return array{disk: int, bandwidth: int}
+     * @return array{disk: int, bandwidth: int, disk_limit: int, bandwidth_limit: int}
      */
     public function getUsage(): array
     {
@@ -655,186 +540,795 @@ class paneldns extends HostingModule
 
         if (!$this->api) return $empty;
 
-        $id = $this->orgId();
+        $id = $this->subClientId();
         if ($id <= 0) return $empty;
 
-        $resp = $this->cachedOrgSummary($id);
+        $resp = $this->cachedSubClientSummary($id);
         if (!$resp['ok']) return $empty;
 
-        $usage = $resp['data']['usage'] ?? [];
-        $plan  = $resp['data']['plan']  ?? [];
+        $usage  = $resp['data']['usage']  ?? [];
+        $limits = $resp['data']['limits'] ?? [];
 
         return [
-            'disk'           => (int) ($usage['active_zones'] ?? 0),
-            'bandwidth'      => (int) ($usage['sub_clients']  ?? 0),
-            // Limits: 0 means unlimited in HostBill graph rendering.
-            'disk_limit'     => isset($plan['zones'])   && $plan['zones']   !== null ? (int) $plan['zones']   : 0,
-            'bandwidth_limit'=> isset($plan['clients']) && $plan['clients'] !== null ? (int) $plan['clients'] : 0,
+            'disk'            => (int) ($usage['zones']   ?? 0),
+            'bandwidth'       => (int) ($usage['records'] ?? 0),
+            // 0 = unlimited in HostBill graph rendering.
+            'disk_limit'      => (int) ($limits['zones']  ?? 0),
+            'bandwidth_limit' => (int) ($limits['records'] ?? 0),
         ];
     }
 
     /**
      * Called by HostBill to render extra info in the admin service view.
      * Returns a self-contained HTML snippet; all values are escaped.
+     * Matches the adminServicesTabFields() detail panel in the WHMCS module.
      *
      * @return string HTML string.
      */
     public function getServiceDetails(): string
     {
-        $h = fn (mixed $v): string => htmlspecialchars((string) $v, ENT_QUOTES, 'UTF-8');
+        $id = $this->subClientId();
+        if ($id <= 0) return '<em>Not provisioned.</em>';
+        if (!$this->api) return '<em>PanelDNS: server connection not initialised.</em>';
 
-        $id = $this->orgId();
-        if ($id <= 0) {
-            return '<em>Not provisioned.</em>';
-        }
-
-        if (!$this->api) {
-            return '<em>PanelDNS: server connection not initialised.</em>';
-        }
-
-        $resp = $this->cachedOrgSummary($id);
+        $resp = $this->cachedSubClientSummary($id);
         if (!$resp['ok']) {
-            return '<em>PanelDNS: could not load service details.</em>';
+            return '<em>PanelDNS: could not load service details ('
+                . $this->h($resp['error'] ?? 'API error') . ').</em>';
         }
 
-        $data   = $resp['data'];
-        $org    = $data['org']   ?? [];
-        $usage  = $data['usage'] ?? [];
-        $plan   = $data['plan']  ?? [];
+        $sub    = $resp['data']['sub_client'] ?? [];
+        $usage  = $resp['data']['usage']      ?? [];
+        $limits = $resp['data']['limits']     ?? [];
+        $server = $resp['data']['server']     ?? [];
 
-        $status = $org['status'] ?? 'unknown';
-        $statusColor = match ($status) {
+        $status = $sub['status'] ?? 'unknown';
+        $colour = match ($status) {
             'active'    => '#0a7',
             'suspended' => '#c80',
             default     => '#888',
         };
 
-        $zonesLimit   = isset($plan['zones'])   && $plan['zones']   !== null ? (int) $plan['zones']   : null;
-        $clientsLimit = isset($plan['clients']) && $plan['clients'] !== null ? (int) $plan['clients'] : null;
+        $zonesUsed  = (int) ($usage['zones']   ?? 0);
+        $zonesLimit = (int) ($limits['zones']  ?? 0);
+        $recsUsed   = (int) ($usage['records'] ?? 0);
+        $recsLimit  = (int) ($limits['records'] ?? 0);
 
-        $zonesStr   = (int) ($usage['active_zones'] ?? 0) . ' / ' . ($zonesLimit   !== null ? $zonesLimit   : '∞');
-        $clientsStr = (int) ($usage['sub_clients']  ?? 0) . ' / ' . ($clientsLimit !== null ? $clientsLimit : '∞');
+        $zoneBar = $this->progressBar($zonesUsed, $zonesLimit);
+        $recsBar = $this->progressBar($recsUsed, $recsLimit);
 
-        return '<table style="border-collapse:collapse;font-size:13px;width:100%;">'
-            . '<tr><th style="text-align:left;padding:3px 8px;">Org ID</th>'
-            .     '<td style="padding:3px 8px;">' . $h($id) . '</td></tr>'
-            . '<tr><th style="text-align:left;padding:3px 8px;">Status</th>'
-            .     '<td style="padding:3px 8px;color:' . $h($statusColor) . ';font-weight:600;text-transform:capitalize;">' . $h($status) . '</td></tr>'
-            . '<tr><th style="text-align:left;padding:3px 8px;">Plan</th>'
-            .     '<td style="padding:3px 8px;">' . ($plan ? $h($plan['name'] ?? '—') : '—') . '</td></tr>'
-            . '<tr><th style="text-align:left;padding:3px 8px;">Zones used / limit</th>'
-            .     '<td style="padding:3px 8px;">' . $h($zonesStr) . '</td></tr>'
-            . '<tr><th style="text-align:left;padding:3px 8px;">Sub-clients used / limit</th>'
-            .     '<td style="padding:3px 8px;">' . $h($clientsStr) . '</td></tr>'
-            . '<tr><th style="text-align:left;padding:3px 8px;">API calls this period</th>'
-            .     '<td style="padding:3px 8px;">' . $h((int) ($usage['api_calls_current_period'] ?? 0)) . '</td></tr>'
-            . '<tr><th style="text-align:left;padding:3px 8px;">Module version</th>'
-            .     '<td style="padding:3px 8px;">' . $h('paneldns-hostbill v' . $this->version) . '</td></tr>'
-            . '</table>';
-    }
+        $lastSync = $usage['last_synced_at']
+            ?? $sub['last_synced_at']
+            ?? $server['last_synced_at']
+            ?? null;
+        $lastSyncStr = $lastSync
+            ? $this->h($lastSync)
+            : '<span style="color:#9ca3af;">—</span>';
 
-    /**
-     * Called by HostBill to render HTML in the client portal service view.
-     * Returns a self-contained HTML block (no template files — HostBill embeds it).
-     * All server-supplied values are escaped.
-     *
-     * @return string HTML string.
-     */
-    public function clientArea(): string
-    {
-        $h = fn (mixed $v): string => htmlspecialchars((string) $v, ENT_QUOTES, 'UTF-8');
-
-        $id = $this->orgId();
-
-        // SSO button is always shown — even without usage data.
-        $ssoButton = '<a href="?action=sso" class="btn btn-primary">Login to PanelDNS</a>';
-
-        if ($id <= 0 || !$this->api) {
-            return $ssoButton;
-        }
-
-        $resp = $this->cachedOrgSummary($id);
-
-        if (!$resp['ok']) {
-            // Non-fatal: show just the button if summary is unavailable.
-            return $ssoButton;
-        }
-
-        $data   = $resp['data'];
-        $org    = $data['org']   ?? [];
-        $usage  = $data['usage'] ?? [];
-        $plan   = $data['plan']  ?? [];
-
-        $status = $org['status'] ?? 'unknown';
-
-        $zonesUsed   = (int) ($usage['active_zones'] ?? 0);
-        $clientsUsed = (int) ($usage['sub_clients']  ?? 0);
-        $zonesLimit  = isset($plan['zones'])   && $plan['zones']   !== null ? (int) $plan['zones']   : null;
-        $clLimit     = isset($plan['clients']) && $plan['clients'] !== null ? (int) $plan['clients'] : null;
-        $planName    = ($plan['name'] ?? '') !== '' ? $plan['name'] : null;
-
-        $zonesStr   = $h($zonesUsed)   . ' / ' . ($zonesLimit !== null ? $h($zonesLimit) : '∞') . ' zones';
-        $clientsStr = $h($clientsUsed) . ' / ' . ($clLimit    !== null ? $h($clLimit)    : '∞') . ' sub-clients';
-
-        $suspendedNote = '';
-        if ($status === 'suspended') {
-            $suspendedNote = '<div style="margin-top:10px;color:#c00;">'
-                . '<strong>Your account is currently suspended.</strong> '
-                . 'Please contact support to restore access.'
-                . '</div>';
-        }
-
-        // GDPR-LEGAL-01: surface a re-consent banner when the org owner has not yet
-        // accepted the current platform legal terms. This mirrors the WHMCS module's
-        // paneldns_requires_consent template variable. Only shown when a Terms URL is
-        // configured on the product (option10) — without a URL there is nowhere to link.
-        $consentBanner = '';
-        if ((bool) ($org['requires_consent'] ?? false)) {
-            $portalTermsUrl = trim((string) ($this->options['option10']['value'] ?? ''));
-            if ($portalTermsUrl !== '') {
-                $consentBanner = '<div style="margin-top:10px;padding:10px;background:#fff3cd;'
-                    . 'border:1px solid #ffc107;border-radius:4px;font-size:13px;">'
-                    . '<strong>Action required:</strong> Please '
-                    . '<a href="' . $h($portalTermsUrl) . '" target="_blank" rel="noopener noreferrer">'
-                    . 'review and accept</a> the updated Terms of Service for your PanelDNS portal.'
-                    . '</div>';
+        // ZONE-LIST-01: fetch up to 20 zone names for this sub-client.
+        $zoneNames = '<span style="color:#9ca3af;">—</span>';
+        $zonesResp = $this->api->get('/api/v1/zones', ['sub_client_id' => $id, 'per_page' => 20]);
+        if ($zonesResp['ok'] && !empty($zonesResp['data'])) {
+            $names     = array_map(fn ($z) => $this->h($z['name'] ?? ''), $zonesResp['data']);
+            $zoneNames = implode('<br>', $names);
+            if (count($names) >= 20) {
+                $zoneNames .= '<br><em style="color:#9ca3af;font-size:11px;">… and more</em>';
             }
         }
 
-        return '<div>'
-            . $ssoButton
-            . '<div style="margin-top:12px;font-size:13px;">'
-            . ($planName !== null ? '<div style="margin-bottom:6px;color:#6b7280;">Plan: ' . $h($planName) . '</div>' : '')
-            .     '<span style="margin-right:16px;">' . $zonesStr   . '</span>'
-            .     '<span>'                             . $clientsStr . '</span>'
-            . '</div>'
-            . $suspendedNote
-            . $consentBanner
+        return '<table style="border-collapse:collapse;font-size:13px;width:100%;">'
+            . '<tr><th style="text-align:left;padding:3px 8px;">Module version</th>'
+            .     '<td style="padding:3px 8px;color:#6b7280;">paneldns-hostbill v' . $this->h($this->version) . '</td></tr>'
+            . '<tr><th style="text-align:left;padding:3px 8px;">Sub-client ID</th>'
+            .     '<td style="padding:3px 8px;font-weight:600;">' . $this->h($id) . '</td></tr>'
+            . '<tr><th style="text-align:left;padding:3px 8px;">Status</th>'
+            .     '<td style="padding:3px 8px;color:' . $this->h($colour) . ';font-weight:600;text-transform:capitalize;">' . $this->h($status) . '</td></tr>'
+            . '<tr><th style="text-align:left;padding:3px 8px;">Sub-client Email</th>'
+            .     '<td style="padding:3px 8px;">' . $this->h($sub['email'] ?? '') . '</td></tr>'
+            . '<tr><th style="text-align:left;padding:3px 8px;">Zones used / limit</th>'
+            .     '<td style="padding:3px 8px;">'
+            .         $this->h("{$zonesUsed} / " . ($zonesLimit > 0 ? $zonesLimit : '∞'))
+            .         $zoneBar
+            .     '</td></tr>'
+            . '<tr><th style="text-align:left;padding:3px 8px;">Records used / limit</th>'
+            .     '<td style="padding:3px 8px;">'
+            .         $this->h("{$recsUsed} / " . ($recsLimit > 0 ? $recsLimit : '∞'))
+            .         $recsBar
+            .     '</td></tr>'
+            . '<tr><th style="text-align:left;padding:3px 8px;">Last sync</th>'
+            .     '<td style="padding:3px 8px;">' . $lastSyncStr . '</td></tr>'
+            . '<tr><th style="text-align:left;padding:3px 8px;vertical-align:top;">Zones</th>'
+            .     '<td style="padding:3px 8px;font-size:12px;">' . $zoneNames . '</td></tr>'
+            . '</table>';
+    }
+
+    // ── Client area ───────────────────────────────────────────────────────────
+
+    /**
+     * Called by HostBill to render HTML in the client portal service view.
+     * Returns a self-contained HTML block embedded in HostBill's page.
+     *
+     * Navigation is GET-based (?pdns=zones, ?pdns=records&zone=N, etc.).
+     * Mutations are POST-based (hidden pdns_action field in each form).
+     * All server-supplied values are escaped with htmlspecialchars().
+     */
+    public function clientArea(): string
+    {
+        if (!$this->api) {
+            return '<div class="alert alert-danger">PanelDNS: server connection not configured. Please contact support.</div>';
+        }
+
+        if ($this->subClientId() <= 0) {
+            return '<div class="alert alert-info">Your DNS hosting account is being set up. Please check back shortly or contact support.</div>';
+        }
+
+        // POST mutations take priority over GET page renders.
+        $postAction = trim((string) ($_POST['pdns_action'] ?? ''));
+        if ($postAction !== '') {
+            return $this->dispatchPostAction($postAction);
+        }
+
+        $getPage = trim((string) ($_GET['pdns'] ?? ''));
+
+        // SSO redirect: mint a token and use a JS redirect (since we return HTML).
+        if ($getPage === 'sso') {
+            return $this->doClientSsoRedirect();
+        }
+
+        // EXPORT-01: BIND zone download — streams file and exits (never returns HTML).
+        if ($getPage === 'zone-export') {
+            return $this->doZoneExport();
+        }
+
+        return match ($getPage) {
+            'zones'       => $this->renderZonesList(),
+            'records'     => $this->renderRecords(),
+            'zone-create' => $this->renderZoneCreate(),
+            'zone-import' => $this->renderZoneImport(),
+            default       => $this->renderOverview(),
+        };
+    }
+
+    // ── POST dispatch ─────────────────────────────────────────────────────────
+
+    /**
+     * Dispatch a POST mutation after verifying CSRF.
+     * All mutating form submissions go through here.
+     */
+    private function dispatchPostAction(string $action): string
+    {
+        $this->requireCsrf();
+
+        return match ($action) {
+            'do-zone-create'   => $this->doZoneCreate(),
+            'do-zone-import'   => $this->doZoneImport(),
+            'do-zone-delete'   => $this->doZoneDelete(),
+            'do-record-create' => $this->doRecordCreate(),
+            'do-record-update' => $this->doRecordUpdate(),
+            'do-record-delete' => $this->doRecordDelete(),
+            'do-dnssec-toggle' => $this->doDnssecToggle(),
+            default            => $this->renderOverview(),
+        };
+    }
+
+    // ── Client area pages ─────────────────────────────────────────────────────
+
+    /**
+     * Overview — default client area view.
+     * Shows usage cards, nameservers, zone health widget, and action buttons.
+     */
+    private function renderOverview(): string
+    {
+        $id   = $this->subClientId();
+        $out  = $this->flashHtml();
+
+        $resp = $this->cachedSubClientSummary($id);
+        if (!$resp['ok']) {
+            return $out
+                . '<div class="alert alert-warning">Could not load account details. Please try again or contact support.</div>'
+                . '<a href="' . $this->h($this->pageUrl('sso')) . '" class="btn btn-primary">Login to PanelDNS Portal</a>';
+        }
+
+        $sub    = $resp['data']['sub_client'] ?? [];
+        $usage  = $resp['data']['usage']      ?? [];
+        $limits = $resp['data']['limits']     ?? [];
+        $status = $sub['status'] ?? 'unknown';
+
+        // Suspension notice.
+        if ($status === 'suspended') {
+            $out .= '<div class="alert alert-danger"><strong>Your account is currently suspended.</strong> '
+                . 'Please contact support to restore access.</div>';
+        }
+
+        // GDPR consent banner (CONSENT-R-02): show when sub-client has not accepted
+        // the current terms, mirrors paneldns_requires_consent in the WHMCS template.
+        if ((bool) ($sub['requires_consent'] ?? false) && !empty($sub['portal_sso_url'])) {
+            $out .= '<div class="alert alert-warning"><strong>Action required:</strong> '
+                . 'Please <a href="' . $this->h($sub['portal_sso_url']) . '" target="_blank" rel="noopener noreferrer">'
+                . 'review and accept</a> the updated Terms of Service for your PanelDNS portal.</div>';
+        }
+
+        // Usage cards.
+        $zonesUsed  = (int) ($usage['zones']   ?? 0);
+        $zonesLimit = (int) ($limits['zones']  ?? 0);
+        $recsUsed   = (int) ($usage['records'] ?? 0);
+        $recsLimit  = (int) ($limits['records'] ?? 0);
+
+        $out .= '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:16px;">';
+        $out .= $this->usageCard('DNS Zones',   $zonesUsed, $zonesLimit);
+        $out .= $this->usageCard('DNS Records', $recsUsed,  $recsLimit);
+        $out .= '</div>';
+
+        // Nameservers.
+        $ns = $this->cachedNameservers();
+        if (!empty($ns)) {
+            $out .= '<div class="panel panel-default" style="margin-bottom:16px;">'
+                . '<div class="panel-heading"><strong>Your Nameservers</strong></div>'
+                . '<div class="panel-body"><p style="margin-bottom:8px;color:#6b7280;font-size:13px;">'
+                . 'Point your domains to these nameservers:</p>'
+                . '<ul style="margin:0;padding-left:20px;">';
+            foreach ($ns as $n) {
+                $out .= '<li><code>' . $this->h($n) . '</code></li>';
+            }
+            $out .= '</ul></div></div>';
+        }
+
+        // Zone health widget: surface only troubled zones so client sees problems first.
+        try {
+            $zonesResp = $this->api->get('/api/v1/zones', ['sub_client_id' => $id, 'per_page' => 20]);
+            if ($zonesResp['ok'] && !empty($zonesResp['data'])) {
+                $troubled = array_filter($zonesResp['data'], fn ($z) => ($z['status'] ?? 'active') !== 'active');
+                if (!empty($troubled)) {
+                    $out .= '<div class="alert alert-warning"><strong>Zone issues detected:</strong>'
+                        . '<ul style="margin:4px 0 0 16px;">';
+                    foreach ($troubled as $z) {
+                        $out .= '<li>' . $this->h($z['name'] ?? '') . ' — ' . $this->h($z['status'] ?? '') . '</li>';
+                    }
+                    $out .= '</ul></div>';
+                }
+            }
+        } catch (\Throwable $e) { /* non-fatal — widget simply does not render */ }
+
+        // Action buttons.
+        $out .= '<div style="display:flex;gap:8px;flex-wrap:wrap;">';
+        $out .= '<a href="' . $this->h($this->pageUrl('zones')) . '" class="btn btn-primary">Manage DNS Zones</a> ';
+        $out .= '<a href="' . $this->h($this->pageUrl('sso'))   . '" class="btn btn-default">Open Full Portal</a>';
+        $out .= '</div>';
+
+        return $out;
+    }
+
+    /**
+     * Zones list — table of all zones for this sub-client.
+     */
+    private function renderZonesList(): string
+    {
+        $id    = $this->subClientId();
+        $resp  = $this->api->get('/api/v1/zones', ['sub_client_id' => $id, 'per_page' => 100]);
+        $zones = $resp['ok'] ? ($resp['data'] ?? []) : [];
+        $csrf  = $this->csrfToken();
+        $out   = $this->flashHtml();
+
+        $out .= '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">'
+            . '<h4 style="margin:0;">DNS Zones</h4>'
+            . '<div>'
+            . '<a href="' . $this->h($this->pageUrl('zone-create')) . '" class="btn btn-sm btn-success">+ Add Zone</a> '
+            . '<a href="' . $this->h($this->pageUrl('zone-import')) . '" class="btn btn-sm btn-default">Import BIND</a> '
+            . '<a href="' . $this->h($this->pageUrl()) . '" class="btn btn-sm btn-link">← Overview</a>'
+            . '</div></div>';
+
+        if (!$resp['ok']) {
+            $out .= '<div class="alert alert-danger">Could not load zones: ' . $this->h($resp['error'] ?? 'API error') . '</div>';
+            return $out;
+        }
+
+        if (empty($zones)) {
+            $out .= '<div class="alert alert-info">No zones yet. '
+                . '<a href="' . $this->h($this->pageUrl('zone-create')) . '">Add your first zone →</a></div>';
+            return $out;
+        }
+
+        $out .= '<table class="table table-striped table-hover" style="font-size:13px;">'
+            . '<thead><tr><th>Zone Name</th><th>Status</th><th>Records</th><th>Actions</th></tr></thead>'
+            . '<tbody>';
+
+        foreach ($zones as $zone) {
+            $zid      = (int) ($zone['id'] ?? 0);
+            $name     = (string) ($zone['name'] ?? '');
+            $zstatus  = (string) ($zone['status'] ?? 'active');
+            $recCount = (int) ($zone['record_count'] ?? 0);
+            $zcolour  = $zstatus === 'active' ? '#0a7' : '#c80';
+
+            $recordsUrl = $this->pageUrl('records') . '&zone=' . $zid;
+            $exportUrl  = $this->pageUrl('zone-export') . '&zone=' . $zid;
+
+            $out .= '<tr>'
+                . '<td>' . $this->h($name) . '</td>'
+                . '<td><span style="color:' . $this->h($zcolour) . ';font-weight:600;text-transform:capitalize;">'
+                .     $this->h($zstatus) . '</span></td>'
+                . '<td>' . $this->h($recCount) . '</td>'
+                . '<td>'
+                .     '<a href="' . $this->h($recordsUrl) . '" class="btn btn-xs btn-primary">Manage</a> '
+                .     '<a href="' . $this->h($exportUrl)  . '" class="btn btn-xs btn-default">Export</a> '
+                .     '<form method="POST" action="" style="display:inline;" '
+                .         'onsubmit="return confirm(\'Delete zone ' . addslashes($this->h($name)) . '? This cannot be undone.\')">'
+                .         '<input type="hidden" name="pdns_action" value="do-zone-delete">'
+                .         '<input type="hidden" name="zone_id" value="' . $this->h($zid) . '">'
+                .         '<input type="hidden" name="csrf" value="' . $this->h($csrf) . '">'
+                .         '<button type="submit" class="btn btn-xs btn-danger">Delete</button>'
+                .     '</form>'
+                . '</td>'
+                . '</tr>';
+        }
+
+        $out .= '</tbody></table>';
+        return $out;
+    }
+
+    /**
+     * Records page — table of records for one zone, plus add/edit forms and DNSSEC.
+     */
+    private function renderRecords(): string
+    {
+        $zoneId = (int) ($_GET['zone'] ?? 0);
+        if ($zoneId <= 0) { return $this->renderZonesList(); }
+
+        $zone = $this->fetchOwnZone($zoneId);
+        if (!$zone) {
+            $this->flash('error', 'Zone not found.');
+            return $this->renderZonesList();
+        }
+
+        $records = $this->api->get("/api/v1/zones/{$zoneId}/records", ['per_page' => 200]);
+        $recs    = $records['ok'] ? ($records['data'] ?? []) : [];
+        $dnssec  = $this->fetchDnssecStatus($zoneId);
+        $ns      = $this->cachedNameservers();
+        $csrf    = $this->csrfToken();
+        $editId  = (int) ($_GET['edit'] ?? 0) ?: null;
+        $out     = $this->flashHtml();
+
+        // Header.
+        $out .= '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">'
+            . '<h4 style="margin:0;">Records: <strong>' . $this->h($zone['name'] ?? '') . '</strong></h4>'
+            . '<a href="' . $this->h($this->pageUrl('zones')) . '" class="btn btn-sm btn-link">← Zones</a>'
             . '</div>';
+
+        // NS-CARD-01: nameservers "point your domain here" card.
+        if (!empty($ns)) {
+            $out .= '<div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:4px;padding:10px 14px;margin-bottom:14px;font-size:13px;">'
+                . '<strong>Point your domain here:</strong> '
+                . implode(', ', array_map(fn ($n) => '<code>' . $this->h($n) . '</code>', $ns))
+                . '</div>';
+        }
+
+        if (!$records['ok']) {
+            $out .= '<div class="alert alert-danger">Could not load records: ' . $this->h($records['error'] ?? 'API error') . '</div>';
+        } elseif (empty($recs)) {
+            $out .= '<div class="alert alert-info">No records yet. Add one below.</div>';
+        } else {
+            $out .= '<table class="table table-condensed table-hover" style="font-size:12px;">'
+                . '<thead><tr><th>Name</th><th>Type</th><th>Content</th><th>TTL</th><th>Prio</th><th>Actions</th></tr></thead>'
+                . '<tbody>';
+
+            foreach ($recs as $rec) {
+                $rid    = (int) ($rec['id'] ?? 0);
+                $isEdit = ($editId !== null && $editId === $rid);
+
+                if ($isEdit) {
+                    $out .= '<tr style="background:#fffbeb;"><td colspan="6">'
+                        . $this->recordEditFormHtml($zoneId, $rec, $csrf)
+                        . '</td></tr>';
+                } else {
+                    $editUrl = $this->pageUrl('records') . '&zone=' . $zoneId . '&edit=' . $rid;
+                    $out .= '<tr>'
+                        . '<td>' . $this->h($rec['name'] ?? '') . '</td>'
+                        . '<td><span class="label label-default">' . $this->h($rec['type'] ?? '') . '</span></td>'
+                        . '<td style="max-width:280px;word-break:break-all;">' . $this->h($rec['content'] ?? '') . '</td>'
+                        . '<td>' . $this->h($rec['ttl'] ?? '') . '</td>'
+                        . '<td>' . $this->h($rec['priority'] ?? '') . '</td>'
+                        . '<td>'
+                        .     '<a href="' . $this->h($editUrl) . '" class="btn btn-xs btn-default">Edit</a> '
+                        .     '<form method="POST" action="" style="display:inline;" onsubmit="return confirm(\'Delete this record?\')">'
+                        .         '<input type="hidden" name="pdns_action" value="do-record-delete">'
+                        .         '<input type="hidden" name="zone_id" value="' . $this->h($zoneId) . '">'
+                        .         '<input type="hidden" name="record_id" value="' . $this->h($rid) . '">'
+                        .         '<input type="hidden" name="csrf" value="' . $this->h($csrf) . '">'
+                        .         '<button type="submit" class="btn btn-xs btn-danger">Del</button>'
+                        .     '</form>'
+                        . '</td></tr>';
+                }
+            }
+            $out .= '</tbody></table>';
+        }
+
+        // Add record form.
+        $out .= '<div class="panel panel-default" style="margin-top:16px;">'
+            . '<div class="panel-heading"><strong>Add Record</strong></div>'
+            . '<div class="panel-body">'
+            . $this->recordAddFormHtml($zoneId, $csrf)
+            . '</div></div>';
+
+        // DNSSEC-01: signing state + DS records card. null if provider doesn't support it.
+        if ($dnssec !== null) {
+            $enabled = (bool) ($dnssec['enabled'] ?? false);
+            $out .= '<div class="panel panel-default" style="margin-top:12px;">'
+                . '<div class="panel-heading"><strong>DNSSEC</strong></div>'
+                . '<div class="panel-body">'
+                . '<p>Signing is currently <strong>' . ($enabled ? 'enabled' : 'disabled') . '</strong>.</p>';
+            if ($enabled && !empty($dnssec['ds_records'])) {
+                $out .= '<p><strong>DS Records</strong> (add these to your domain registrar):</p>'
+                    . '<ul style="font-family:monospace;font-size:12px;">';
+                foreach ($dnssec['ds_records'] as $ds) {
+                    $out .= '<li>' . $this->h($ds) . '</li>';
+                }
+                $out .= '</ul>';
+            }
+            $out .= '<form method="POST" action="">'
+                . '<input type="hidden" name="pdns_action" value="do-dnssec-toggle">'
+                . '<input type="hidden" name="zone_id" value="' . $this->h($zoneId) . '">'
+                . '<input type="hidden" name="enable" value="' . ($enabled ? '0' : '1') . '">'
+                . '<input type="hidden" name="csrf" value="' . $this->h($csrf) . '">'
+                . '<button type="submit" class="btn btn-sm ' . ($enabled ? 'btn-warning' : 'btn-success') . '">'
+                . ($enabled ? 'Disable DNSSEC' : 'Enable DNSSEC')
+                . '</button></form>'
+                . '</div></div>';
+        }
+
+        return $out;
+    }
+
+    /**
+     * Zone create form.
+     */
+    private function renderZoneCreate(): string
+    {
+        $csrf = $this->csrfToken();
+        $out  = $this->flashHtml();
+        $out .= '<div style="max-width:480px;">'
+            . '<div style="display:flex;justify-content:space-between;margin-bottom:12px;">'
+            .     '<h4 style="margin:0;">Add DNS Zone</h4>'
+            .     '<a href="' . $this->h($this->pageUrl('zones')) . '" class="btn btn-sm btn-link">← Zones</a>'
+            . '</div>'
+            . '<form method="POST" action="">'
+            .     '<input type="hidden" name="pdns_action" value="do-zone-create">'
+            .     '<input type="hidden" name="csrf" value="' . $this->h($csrf) . '">'
+            .     '<div class="form-group">'
+            .         '<label>Zone Name (domain)</label>'
+            .         '<input type="text" name="name" class="form-control" placeholder="example.com" required autocomplete="off">'
+            .     '</div>'
+            .     '<button type="submit" class="btn btn-primary">Create Zone</button>'
+            . '</form></div>';
+        return $out;
+    }
+
+    /**
+     * Zone import form (BIND-format text input).
+     */
+    private function renderZoneImport(): string
+    {
+        $csrf     = $this->csrfToken();
+        $id       = $this->subClientId();
+        $zonesRsp = $this->api->get('/api/v1/zones', ['sub_client_id' => $id, 'per_page' => 100]);
+        $zones    = $zonesRsp['ok'] ? ($zonesRsp['data'] ?? []) : [];
+        $out      = $this->flashHtml();
+
+        $out .= '<div style="max-width:640px;">'
+            . '<div style="display:flex;justify-content:space-between;margin-bottom:12px;">'
+            .     '<h4 style="margin:0;">Import BIND Zone</h4>'
+            .     '<a href="' . $this->h($this->pageUrl('zones')) . '" class="btn btn-sm btn-link">← Zones</a>'
+            . '</div>'
+            . '<form method="POST" action="">'
+            .     '<input type="hidden" name="pdns_action" value="do-zone-import">'
+            .     '<input type="hidden" name="csrf" value="' . $this->h($csrf) . '">'
+            .     '<div class="form-group">'
+            .         '<label>Target Zone</label>'
+            .         '<select name="zone_id" class="form-control" required>'
+            .         '<option value="">— Select zone —</option>';
+        foreach ($zones as $zone) {
+            $out .= '<option value="' . $this->h($zone['id'] ?? '') . '">'
+                . $this->h($zone['name'] ?? '') . '</option>';
+        }
+        $out .=     '</select></div>'
+            . '<div class="form-group">'
+            .     '<label>BIND Zone Data</label>'
+            .     '<textarea name="bind" class="form-control" rows="12" '
+            .         'placeholder="; paste BIND-format zone text here" required '
+            .         'style="font-family:monospace;font-size:12px;"></textarea>'
+            .     '<small class="text-muted">Maximum 512 KB. Import adds new records; does not remove existing ones.</small>'
+            . '</div>'
+            . '<button type="submit" class="btn btn-primary">Import</button>'
+            . '</form></div>';
+        return $out;
+    }
+
+    // ── Mutations ─────────────────────────────────────────────────────────────
+
+    private function doZoneCreate(): string
+    {
+        $name = trim((string) ($_POST['name'] ?? ''));
+        if ($name === '') {
+            $this->flash('error', 'Zone name is required.');
+            return $this->renderZoneCreate();
+        }
+
+        // FIX-H4: validate zone name — 253 char limit, no consecutive dots, RFC-safe chars.
+        if (
+            strlen($name) > 253
+            || str_contains($name, '..')
+            || !preg_match('/^[a-zA-Z0-9]([a-zA-Z0-9_\-]|\.[a-zA-Z0-9])*$/', $name)
+        ) {
+            $this->flash('error', 'Invalid zone name.');
+            return $this->renderZoneCreate();
+        }
+
+        $id = $this->subClientId();
+
+        // QUOTA-01: pre-flight check — friendly message rather than a raw API error.
+        $summary = $this->api->subClientSummary($id);
+        if ($summary['ok']) {
+            $used  = (int) ($summary['data']['usage']['zones']  ?? 0);
+            $limit = (int) ($summary['data']['limits']['zones'] ?? 0);
+            if ($limit > 0 && $used >= $limit) {
+                $this->flash('error', "You've reached your zone limit ({$used}/{$limit}). Please contact support to upgrade.");
+                return $this->renderZoneCreate();
+            }
+        }
+
+        $resp = $this->api->post('/api/v1/zones', [
+            'name'          => $name,
+            'sub_client_id' => $id,
+        ]);
+
+        if (!$resp['ok']) {
+            $this->flash('error', 'Failed to create zone: ' . $this->apiError($resp));
+            return $this->renderZoneCreate();
+        }
+
+        $this->rotateCsrf();
+        $this->flash('success', 'Zone ' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8') . ' created.');
+        return $this->renderZonesList();
+    }
+
+    /**
+     * EXPORT-01: stream the zone's BIND-format text as a file download.
+     * Must be triggered via GET (?pdns=zone-export&zone=N). Outputs headers
+     * + body and exits; never returns to the client area template.
+     */
+    private function doZoneExport(): string
+    {
+        $zoneId = (int) ($_GET['zone'] ?? 0);
+        if ($zoneId <= 0) {
+            $this->flash('error', 'Zone ID required for export.');
+            return $this->renderZonesList();
+        }
+
+        $zone = $this->fetchOwnZone($zoneId);
+        if (!$zone) {
+            $this->flash('error', 'Zone not found.');
+            return $this->renderZonesList();
+        }
+
+        $resp = $this->api->get("/api/v1/zones/{$zoneId}/export");
+
+        // Export returns text/plain — check HTTP status, not 'ok' (which requires JSON).
+        if (
+            ($resp['status'] ?? 0) < 200
+            || ($resp['status'] ?? 0) >= 300
+            || trim((string) ($resp['raw_body'] ?? '')) === ''
+        ) {
+            $this->flash('error', 'Export failed. The zone may not have a DNS provider configured yet.');
+            return $this->renderZonesList();
+        }
+
+        $zoneName = preg_replace('/[^a-z0-9._-]/i', '_', (string) ($zone['name'] ?? 'zone'));
+        header('Content-Type: text/plain; charset=utf-8');
+        header('Content-Disposition: attachment; filename="' . $zoneName . '.zone"');
+        header('Content-Length: ' . strlen((string) $resp['raw_body']));
+        header('Cache-Control: no-cache, no-store, must-revalidate');
+        echo $resp['raw_body'];
+        exit;
+    }
+
+    private function doZoneImport(): string
+    {
+        $zoneId   = (int) ($_POST['zone_id'] ?? 0);
+        $bindText = (string) ($_POST['bind'] ?? '');
+
+        if ($zoneId <= 0) { $this->flash('error', 'Pick a zone first.'); return $this->renderZoneImport(); }
+        // SEC-H9: ownership check BEFORE size cap — prevents large payload allocation for non-owned zones.
+        if (!$this->fetchOwnZone($zoneId)) { $this->flash('error', 'Zone not found.'); return $this->renderZoneImport(); }
+        if (trim($bindText) === '') { $this->flash('error', 'Paste BIND-format zone text.'); return $this->renderZoneImport(); }
+        // SEC-M03: cap import payload to prevent memory-exhaustion DoS.
+        if (strlen($bindText) > 512 * 1024) { $this->flash('error', 'Import data too large (max 512 KB).'); return $this->renderZoneImport(); }
+
+        $resp = $this->api->post("/api/v1/zones/{$zoneId}/import", ['bind' => $bindText]);
+        if (!$resp['ok']) {
+            $this->flash('error', 'Import failed: ' . $this->apiError($resp));
+            return $this->renderZoneImport();
+        }
+
+        $count = $resp['data']['imported'] ?? '?';
+        $this->rotateCsrf();
+        $this->flash('success', "Imported {$count} records into the zone.");
+        return $this->renderZonesList();
+    }
+
+    private function doZoneDelete(): string
+    {
+        $zoneId = (int) ($_POST['zone_id'] ?? 0);
+        if ($zoneId <= 0 || !$this->fetchOwnZone($zoneId)) {
+            $this->flash('error', 'Zone not found.');
+            return $this->renderZonesList();
+        }
+
+        $resp = $this->api->delete("/api/v1/zones/{$zoneId}");
+        if (!$resp['ok']) {
+            $this->flash('error', 'Delete failed: ' . $this->apiError($resp));
+            return $this->renderZonesList();
+        }
+
+        $this->rotateCsrf();
+        $this->flash('success', 'Zone deleted.');
+        return $this->renderZonesList();
+    }
+
+    private function doRecordCreate(): string
+    {
+        $zoneId = (int) ($_POST['zone_id'] ?? 0);
+        if (!$this->fetchOwnZone($zoneId)) {
+            $this->flash('error', 'Zone not found.');
+            return $this->renderZonesList();
+        }
+
+        try {
+            $payload = $this->recordPayloadFromPost();
+        } catch (\InvalidArgumentException $e) {
+            $this->flash('error', $e->getMessage());
+            return $this->renderRecords();
+        }
+
+        $resp = $this->api->post("/api/v1/zones/{$zoneId}/records", $payload);
+        if (!$resp['ok']) {
+            $this->flash('error', 'Add record failed: ' . $this->apiError($resp));
+        } else {
+            $this->rotateCsrf();
+            $this->flash('success', 'Record added.');
+        }
+        return $this->renderRecords();
+    }
+
+    private function doRecordUpdate(): string
+    {
+        $zoneId   = (int) ($_POST['zone_id']   ?? 0);
+        $recordId = (int) ($_POST['record_id'] ?? 0);
+
+        if (!$this->fetchOwnZone($zoneId) || $recordId <= 0) {
+            $this->flash('error', 'Record not found.');
+            return $this->renderZonesList();
+        }
+
+        // FIX-H3: verify the record belongs to this zone before mutating it.
+        $rec = $this->api->get("/api/v1/zones/{$zoneId}/records/{$recordId}");
+        if (!$rec['ok']) {
+            $this->flash('error', 'Record not found.');
+            return $this->renderZonesList();
+        }
+
+        try {
+            $payload = $this->recordPayloadFromPost();
+        } catch (\InvalidArgumentException $e) {
+            $this->flash('error', $e->getMessage());
+            return $this->renderRecords();
+        }
+
+        $resp = $this->api->patch("/api/v1/zones/{$zoneId}/records/{$recordId}", $payload);
+        if (!$resp['ok']) {
+            $this->flash('error', 'Update failed: ' . $this->apiError($resp));
+        } else {
+            $this->rotateCsrf();
+            $this->flash('success', 'Record updated.');
+        }
+        return $this->renderRecords();
+    }
+
+    private function doRecordDelete(): string
+    {
+        $zoneId   = (int) ($_POST['zone_id']   ?? 0);
+        $recordId = (int) ($_POST['record_id'] ?? 0);
+
+        if (!$this->fetchOwnZone($zoneId) || $recordId <= 0) {
+            $this->flash('error', 'Record not found.');
+            return $this->renderZonesList();
+        }
+
+        // FIX-H3: verify the record belongs to this zone before deleting it.
+        $rec = $this->api->get("/api/v1/zones/{$zoneId}/records/{$recordId}");
+        if (!$rec['ok']) {
+            $this->flash('error', 'Record not found.');
+            return $this->renderZonesList();
+        }
+
+        $resp = $this->api->delete("/api/v1/zones/{$zoneId}/records/{$recordId}");
+        if (!$resp['ok']) {
+            $this->flash('error', 'Delete failed: ' . $this->apiError($resp));
+        } else {
+            $this->rotateCsrf();
+            $this->flash('success', 'Record deleted.');
+        }
+        return $this->renderRecords();
+    }
+
+    /**
+     * DNSSEC-01: toggle DNSSEC signing on a zone.
+     */
+    private function doDnssecToggle(): string
+    {
+        $zoneId = (int) ($_POST['zone_id'] ?? 0);
+        if (!$this->fetchOwnZone($zoneId)) {
+            $this->flash('error', 'Zone not found.');
+            return $this->renderZonesList();
+        }
+
+        $enable = isset($_POST['enable']) && (string) $_POST['enable'] === '1';
+        $resp   = $this->api->post("/api/v1/zones/{$zoneId}/dnssec", ['enable' => $enable]);
+
+        if (!$resp['ok']) {
+            $this->flash('error', 'DNSSEC ' . ($enable ? 'enable' : 'disable') . ' failed: ' . $this->apiError($resp));
+        } else {
+            $this->rotateCsrf();
+            $this->flash(
+                'success',
+                $enable
+                    ? 'DNSSEC enabled. Add the DS records shown below to your domain registrar to complete setup.'
+                    : 'DNSSEC disabled.'
+            );
+        }
+        return $this->renderRecords();
+    }
+
+    /**
+     * SSO redirect from within the client area (GET ?pdns=sso).
+     * Uses JavaScript window.location since we are returning HTML — cannot
+     * issue a real 302 from inside clientArea() without exiting.
+     */
+    private function doClientSsoRedirect(): string
+    {
+        $id   = $this->subClientId();
+        $resp = $this->api->mintSubClientSsoToken($id);
+
+        if (
+            $resp['ok']
+            && !empty($resp['data']['login_url'])
+            && str_starts_with((string) ($resp['data']['login_url'] ?? ''), 'https://')
+        ) {
+            $url = $this->h($resp['data']['login_url']);
+            return '<script>window.location.href="' . $url . '";</script>'
+                . '<p>Redirecting to PanelDNS portal…</p>'
+                . '<p><a href="' . $url . '">Click here if not redirected automatically</a>.</p>';
+        }
+
+        $this->flash('error', 'Could not generate portal login link. Please try again or contact support.');
+        return $this->renderOverview();
     }
 
     // ── Drift sync ────────────────────────────────────────────────────────────
 
     /**
-     * Drift-sync check: compare the PanelDNS org status against the local
-     * HostBill service status and report mismatches.
+     * Drift-sync check: compare PanelDNS sub-client statuses against the
+     * caller-supplied HostBill service status map and report mismatches.
      *
-     * Designed to be called from HostBill's Task Scheduler or a custom cron
-     * script. Pass an array of maps via $this->options['drift_sync_map']:
+     * Wire this into HostBill's Task Scheduler to run nightly or hourly.
+     * Pass the service map via $this->options['drift_sync_map']:
      *
      *   [
-     *     ['org_id' => 123, 'status' => 'Active'],    // HostBill service status
-     *     ['org_id' => 456, 'status' => 'Suspended'],
+     *     ['sub_client_id' => 123, 'status' => 'Active'],
+     *     ['sub_client_id' => 456, 'status' => 'Suspended'],
      *   ]
      *
-     * Each entry is checked against PanelDNS live status. Mismatches are
-     * returned in the result array so the caller can trigger
-     * Suspend()/Unsuspend() as appropriate.
-     *
-     * Operators should wire this into HostBill's Task Scheduler
-     * (Settings → Task Scheduler → Add Task) to run nightly or hourly.
-     *
-     * @return array{checked: int, mismatched: list<array{org_id: int, hb_status: string, pdns_status: string}>}
+     * @return array{
+     *   checked: int,
+     *   mismatched: list<array{sub_client_id: int, hb_status: string, pdns_status: string}>
+     * }
      */
     public function driftSync(): array
     {
@@ -847,30 +1341,26 @@ class paneldns extends HostingModule
         $mismatched = [];
 
         foreach ($map as $entry) {
-            $orgId    = (int) ($entry['org_id'] ?? 0);
+            $scId     = (int)   ($entry['sub_client_id'] ?? 0);
             $hbStatus = strtolower(trim((string) ($entry['status'] ?? '')));
-            if ($orgId <= 0 || $hbStatus === '') continue;
-
+            if ($scId <= 0 || $hbStatus === '') continue;
             if (!$this->api) continue;
 
-            $resp = $this->api->orgSummary($orgId);
+            $resp = $this->api->subClientSummary($scId);
             if (!$resp['ok']) continue;
 
             $checked++;
-            $pdnsStatus = strtolower((string) ($resp['data']['org']['status'] ?? ''));
+            $pdnsStatus = strtolower((string) ($resp['data']['sub_client']['status'] ?? ''));
 
-            // Mismatch: PanelDNS says suspended but HostBill considers the service Active.
-            // Mismatch: PanelDNS says active but HostBill considers the service Suspended.
-            $localActive    = $hbStatus === 'active';
-            $localSuspended = $hbStatus === 'suspended';
-            $pdnsSuspended  = $pdnsStatus === 'suspended';
-            $pdnsActive     = $pdnsStatus === 'active';
-
-            if (($localActive && $pdnsSuspended) || ($localSuspended && $pdnsActive)) {
+            // Mismatch: PanelDNS says suspended but HostBill considers active, or vice versa.
+            if (
+                ($hbStatus === 'active'    && $pdnsStatus === 'suspended')
+                || ($hbStatus === 'suspended' && $pdnsStatus === 'active')
+            ) {
                 $mismatched[] = [
-                    'org_id'      => $orgId,
-                    'hb_status'   => $hbStatus,
-                    'pdns_status' => $pdnsStatus,
+                    'sub_client_id' => $scId,
+                    'hb_status'     => $hbStatus,
+                    'pdns_status'   => $pdnsStatus,
                 ];
             }
         }
@@ -878,15 +1368,147 @@ class paneldns extends HostingModule
         return ['checked' => $checked, 'mismatched' => $mismatched];
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ── HTML component helpers ────────────────────────────────────────────────
+
+    private function usageCard(string $label, int $used, int $limit): string
+    {
+        $limitStr = $limit > 0 ? (string) $limit : '∞';
+        $bar      = $this->progressBar($used, $limit);
+        return '<div style="border:1px solid #e5e7eb;border-radius:6px;padding:12px 16px;min-width:160px;">'
+            . '<div style="font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:.05em;">'
+            .     $this->h($label)
+            . '</div>'
+            . '<div style="font-size:22px;font-weight:700;margin:4px 0;">'
+            .     $this->h((string) $used)
+            .     '<span style="font-size:14px;color:#9ca3af;">/' . $this->h($limitStr) . '</span>'
+            . '</div>'
+            . $bar
+            . '</div>';
+    }
+
+    private function progressBar(int $used, int $limit): string
+    {
+        if ($limit <= 0) return '';
+        $pct   = min(100, (int) round($used * 100 / $limit));
+        $color = $pct >= 90 ? '#dc2626' : ($pct >= 75 ? '#f59e0b' : '#0891b2');
+        return ' <span style="display:inline-block;width:80px;height:8px;background:#e5e7eb;border-radius:4px;vertical-align:middle;overflow:hidden;">'
+            . '<span style="display:block;height:100%;width:' . $pct . '%;background:' . $color . ';border-radius:4px;"></span>'
+            . '</span>'
+            . ' <span style="color:#6b7280;font-size:11px;">' . $pct . '%</span>';
+    }
+
+    private function recordAddFormHtml(int $zoneId, string $csrf): string
+    {
+        $types    = ['A','AAAA','CNAME','MX','TXT','NS','SRV','CAA','PTR','TLSA','SSHFP','HTTPS','NAPTR'];
+        $typeOpts = implode('', array_map(fn ($t) => '<option>' . $this->h($t) . '</option>', $types));
+
+        return '<div style="display:grid;grid-template-columns:1fr 90px 1fr 80px 70px auto;gap:6px;align-items:end;">'
+            . '<form method="POST" action="" style="display:contents;">'
+            .   '<input type="hidden" name="pdns_action" value="do-record-create">'
+            .   '<input type="hidden" name="zone_id" value="' . $this->h($zoneId) . '">'
+            .   '<input type="hidden" name="csrf" value="' . $this->h($csrf) . '">'
+            .   '<div><label style="font-size:11px;display:block;margin-bottom:2px;">Name</label>'
+            .       '<input type="text" name="name" value="@" class="form-control input-sm" required></div>'
+            .   '<div><label style="font-size:11px;display:block;margin-bottom:2px;">Type</label>'
+            .       '<select name="type" class="form-control input-sm">' . $typeOpts . '</select></div>'
+            .   '<div><label style="font-size:11px;display:block;margin-bottom:2px;">Content</label>'
+            .       '<input type="text" name="content" class="form-control input-sm" required></div>'
+            .   '<div><label style="font-size:11px;display:block;margin-bottom:2px;">TTL</label>'
+            .       '<input type="number" name="ttl" value="3600" min="60" class="form-control input-sm"></div>'
+            .   '<div><label style="font-size:11px;display:block;margin-bottom:2px;">Prio</label>'
+            .       '<input type="number" name="priority" value="" class="form-control input-sm"></div>'
+            .   '<div><button type="submit" class="btn btn-sm btn-primary">Add</button></div>'
+            . '</form>'
+            . '</div>';
+    }
+
+    private function recordEditFormHtml(int $zoneId, array $rec, string $csrf): string
+    {
+        $rid      = (int) ($rec['id'] ?? 0);
+        $types    = ['A','AAAA','CNAME','MX','TXT','NS','SRV','CAA','PTR','TLSA','SSHFP','HTTPS','NAPTR'];
+        $current  = strtoupper((string) ($rec['type'] ?? 'A'));
+        $typeOpts = implode('', array_map(
+            fn ($t) => '<option' . ($t === $current ? ' selected' : '') . '>' . $this->h($t) . '</option>',
+            $types
+        ));
+        $cancelUrl = $this->pageUrl('records') . '&zone=' . $zoneId;
+
+        return '<div style="display:grid;grid-template-columns:1fr 90px 1fr 80px 70px auto;gap:6px;align-items:end;">'
+            . '<form method="POST" action="" style="display:contents;">'
+            .   '<input type="hidden" name="pdns_action" value="do-record-update">'
+            .   '<input type="hidden" name="zone_id" value="' . $this->h($zoneId) . '">'
+            .   '<input type="hidden" name="record_id" value="' . $this->h($rid) . '">'
+            .   '<input type="hidden" name="csrf" value="' . $this->h($csrf) . '">'
+            .   '<div><label style="font-size:11px;">Name</label>'
+            .       '<input type="text" name="name" value="' . $this->h($rec['name'] ?? '@') . '" class="form-control input-sm" required></div>'
+            .   '<div><label style="font-size:11px;">Type</label>'
+            .       '<select name="type" class="form-control input-sm">' . $typeOpts . '</select></div>'
+            .   '<div><label style="font-size:11px;">Content</label>'
+            .       '<input type="text" name="content" value="' . $this->h($rec['content'] ?? '') . '" class="form-control input-sm" required></div>'
+            .   '<div><label style="font-size:11px;">TTL</label>'
+            .       '<input type="number" name="ttl" value="' . $this->h($rec['ttl'] ?? 3600) . '" min="60" class="form-control input-sm"></div>'
+            .   '<div><label style="font-size:11px;">Prio</label>'
+            .       '<input type="number" name="priority" value="' . $this->h($rec['priority'] ?? '') . '" class="form-control input-sm"></div>'
+            .   '<div style="display:flex;gap:4px;">'
+            .       '<button type="submit" class="btn btn-sm btn-success">Save</button>'
+            .       '<a href="' . $this->h($cancelUrl) . '" class="btn btn-sm btn-default">Cancel</a>'
+            .   '</div>'
+            . '</form>'
+            . '</div>';
+    }
+
+    // ── Core helpers ──────────────────────────────────────────────────────────
 
     /**
-     * CACHE-01: fetch org summary, returning the cached result if it is younger
-     * than 60 seconds. Falls through to a live call on cache miss or API error.
-     * resyncStatus() bypasses this and always calls orgSummary() directly so
-     * the admin's explicit "Resync Status" button always returns fresh data.
+     * Return the stored PanelDNS Sub-client ID for this service, or 0 if not set.
      */
-    private function cachedOrgSummary(int $id): array
+    private function subClientId(): int
+    {
+        $v = $this->details['option1']['value'] ?? '';
+        return is_numeric($v) ? (int) $v : 0;
+    }
+
+    /**
+     * Return the HostBill service ID (used as CSRF session key discriminator).
+     */
+    private function serviceId(): int
+    {
+        return (int) ($this->account_details['id'] ?? 0);
+    }
+
+    /**
+     * Resolve the nameserver list for this product/service.
+     * Prefers per-product NS overrides (option4-7); falls back to the org's
+     * configured nameservers from /api/v1/org/nameservers. Mirrors
+     * PanelDnsResellerService::resolveNameservers() in the WHMCS module.
+     *
+     * @return string[]
+     */
+    private function resolveNameservers(): array
+    {
+        $overrides = array_values(array_filter([
+            trim((string) ($this->options['option4']['value'] ?? '')),
+            trim((string) ($this->options['option5']['value'] ?? '')),
+            trim((string) ($this->options['option6']['value'] ?? '')),
+            trim((string) ($this->options['option7']['value'] ?? '')),
+        ], fn ($v) => $v !== ''));
+
+        if (!empty($overrides)) return $overrides;
+
+        if (!$this->api) return [];
+        $ns = $this->api->nameservers();
+        if ($ns['ok'] && !empty($ns['data']['nameservers'])) {
+            return (array) $ns['data']['nameservers'];
+        }
+        return [];
+    }
+
+    /**
+     * CACHE-01: fetch sub-client summary, returning the cached result if younger
+     * than 60 seconds. Falls through to a live call on miss.
+     * resyncStatus() bypasses this and always calls the API directly.
+     */
+    private function cachedSubClientSummary(int $id): array
     {
         $now = time();
         if (
@@ -895,7 +1517,7 @@ class paneldns extends HostingModule
         ) {
             return self::$summaryCache[$id]['resp'];
         }
-        $resp = $this->api->orgSummary($id);
+        $resp = $this->api->subClientSummary($id);
         if ($resp['ok']) {
             self::$summaryCache[$id] = ['ts' => $now, 'resp' => $resp];
         }
@@ -903,75 +1525,233 @@ class paneldns extends HostingModule
     }
 
     /**
-     * Return the stored PanelDNS Org ID for this service, or 0 if not set.
-     * The org ID is persisted in $this->details['option1']['value'].
+     * CACHE-02: fetch nameservers with a 5-minute in-process cache.
+     * @return string[]
      */
-    private function orgId(): int
+    private function cachedNameservers(): array
     {
-        $v = $this->details['option1']['value'] ?? '';
-        return is_numeric($v) ? (int) $v : 0;
+        if (!$this->api) return [];
+        $key = $this->api->identityHash();
+        $now = time();
+        if (isset(self::$nsCache[$key]) && ($now - self::$nsCache[$key]['ts']) < 300) {
+            return self::$nsCache[$key]['ns'];
+        }
+        $ns = $this->resolveNameservers();
+        self::$nsCache[$key] = ['ts' => $now, 'ns' => $ns];
+        return $ns;
     }
 
     /**
-     * Attempt to fetch the current platform legal version for consent pass-through.
-     * Non-fatal — returns null on any failure.
+     * Verify a zone belongs to the current sub-client before any mutation.
+     * SEC-OWN: never trust a zone ID submitted by the client alone.
      */
-    private function fetchLegalVersion(): ?string
+    private function fetchOwnZone(int $zoneId): ?array
     {
-        try {
-            $resp = $this->api->getLegalVersion();
-            return ($resp['ok'] ?? false) ? ($resp['data']['version'] ?? null) : null;
-        } catch (\Throwable $e) {
-            return null;
+        if ($zoneId <= 0) return null;
+        $resp = $this->api->get("/api/v1/zones/{$zoneId}");
+        if (!$resp['ok']) return null;
+        $z = $resp['data'] ?? null;
+        if (!$z) return null;
+        if ((int) ($z['sub_client_id'] ?? 0) !== $this->subClientId()) return null;
+        return $z;
+    }
+
+    /**
+     * DNSSEC-01: fetch current DNSSEC state for a zone.
+     * Returns null if zone has no provider or provider doesn't support DNSSEC.
+     *
+     * @return array{enabled: bool, algorithm: string|null, ds_records: string[]}|null
+     */
+    private function fetchDnssecStatus(int $zoneId): ?array
+    {
+        $resp = $this->api->get("/api/v1/zones/{$zoneId}/dnssec");
+        if (!$resp['ok']) return null;
+        $d = $resp['data'] ?? null;
+        if (!is_array($d)) return null;
+        return [
+            'enabled'    => (bool) ($d['enabled'] ?? false),
+            'algorithm'  => isset($d['algorithm']) && $d['algorithm'] !== '' ? (string) $d['algorithm'] : null,
+            'ds_records' => is_array($d['ds_records']) ? array_values($d['ds_records']) : [],
+        ];
+    }
+
+    /**
+     * Validate and extract a DNS record payload from $_POST.
+     * SEC-M02: allowlists record type; validates name/content length and chars.
+     *
+     * @throws \InvalidArgumentException on invalid input.
+     */
+    private function recordPayloadFromPost(): array
+    {
+        static $allowed = [
+            'A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS', 'SRV', 'CAA',
+            'PTR', 'TLSA', 'SSHFP', 'HTTPS', 'NAPTR',
+        ];
+
+        $type = strtoupper(trim((string) ($_POST['type'] ?? 'A')));
+        if (!in_array($type, $allowed, true)) {
+            throw new \InvalidArgumentException('Invalid record type: ' . htmlspecialchars($type, ENT_QUOTES, 'UTF-8'));
+        }
+
+        $name    = trim((string) ($_POST['name']    ?? '@'));
+        $content = trim((string) ($_POST['content'] ?? ''));
+
+        // FIX-M3/M4: validate name and content lengths; reject control characters.
+        if (strlen($name) > 253 || preg_match('/[\x00-\x1F\x7F]/', $name)) {
+            throw new \InvalidArgumentException('Record name is invalid or too long.');
+        }
+        if (strlen($content) > 4096 || preg_match('/[\x00\r\n]/', $content)) {
+            throw new \InvalidArgumentException('Record content is invalid or too long.');
+        }
+
+        return array_filter([
+            'name'     => $name,
+            'type'     => $type,
+            'content'  => $content,
+            // FIX-M4: enforce minimum TTL of 60 seconds server-side.
+            'ttl'      => max(60, (int) ($_POST['ttl'] ?? 3600)),
+            'priority' => isset($_POST['priority']) && $_POST['priority'] !== ''
+                ? (int) $_POST['priority']
+                : null,
+        ], fn ($v) => $v !== null);
+    }
+
+    /**
+     * Build a URL for a given page, preserving current query-string params
+     * (minus the existing pdns= param) and appending the new page.
+     */
+    private function pageUrl(string $page = ''): string
+    {
+        $base = strtok((string) ($_SERVER['REQUEST_URI'] ?? '/'), '?');
+        $qs   = [];
+        parse_str((string) ($_SERVER['QUERY_STRING'] ?? ''), $qs);
+        unset($qs['pdns'], $qs['edit']);
+        if ($page !== '') {
+            $qs['pdns'] = $page;
+        }
+        return $base . ($qs ? '?' . http_build_query($qs) : '');
+    }
+
+    // ── CSRF ─────────────────────────────────────────────────────────────────
+
+    /**
+     * Generate a per-session CSRF token tied to the customer's session and the
+     * specific service ID. Bound to service so a token from one product can't be
+     * used to mutate another's DNS.
+     */
+    private function csrfToken(): string
+    {
+        if (session_status() === PHP_SESSION_NONE) { session_start(); }
+        $key = 'paneldns_csrf_' . $this->serviceId();
+        if (empty($_SESSION[$key])) {
+            $_SESSION[$key] = bin2hex(random_bytes(24));
+        }
+        return $_SESSION[$key];
+    }
+
+    /**
+     * FIX-M5: rotate the CSRF token after each successful mutation to prevent
+     * replay attacks. The new token is stored in session for the next render.
+     */
+    private function rotateCsrf(): void
+    {
+        if (session_status() === PHP_SESSION_NONE) { session_start(); }
+        $_SESSION['paneldns_csrf_' . $this->serviceId()] = bin2hex(random_bytes(24));
+    }
+
+    private function requireCsrf(): void
+    {
+        if (session_status() === PHP_SESSION_NONE) { session_start(); }
+        $expected = $_SESSION['paneldns_csrf_' . $this->serviceId()] ?? '';
+        $supplied = (string) ($_POST['csrf'] ?? '');
+        if ($expected === '' || !hash_equals($expected, $supplied)) {
+            http_response_code(403);
+            die('CSRF token mismatch. Please return to the previous page and try again.');
         }
     }
 
-    /**
-     * Mint a one-time SSO login URL and send a welcome email via HostBill's
-     * built-in mail system. Best-effort — failures are logged but do not
-     * block provisioning.
-     */
-    private function sendWelcomeEmail(int $orgId, string $email): void
-    {
-        $sso = $this->api->mintOrgSsoToken($orgId, $email);
+    // ── Flash messages ────────────────────────────────────────────────────────
 
-        // Validate the returned login URL scheme — prevents javascript:/data: injection.
+    private function flash(string $type, string $msg): void
+    {
+        if (session_status() === PHP_SESSION_NONE) { session_start(); }
+        // FIX-M1: cap flash message length — prevents excessively long API errors
+        // from leaking to the client area.
+        $_SESSION['paneldns_flash'] = ['type' => $type, 'msg' => substr((string) $msg, 0, 512)];
+    }
+
+    private function popFlash(): ?array
+    {
+        if (session_status() === PHP_SESSION_NONE) { session_start(); }
+        $f = $_SESSION['paneldns_flash'] ?? null;
+        unset($_SESSION['paneldns_flash']);
+        return $f;
+    }
+
+    private function flashHtml(): string
+    {
+        $f = $this->popFlash();
+        if (!$f) return '';
+        $cls = $f['type'] === 'success' ? 'alert-success' : 'alert-danger';
+        return '<div class="alert ' . $cls . '" style="margin-bottom:12px;">'
+            . $this->h((string) ($f['msg'] ?? ''))
+            . '</div>';
+    }
+
+    /** FIX-M17: cap API error strings before use in flash messages. */
+    private function apiError(array $resp, string $fallback = 'Unknown error.'): string
+    {
+        return substr((string) ($resp['error'] ?? $fallback), 0, 256);
+    }
+
+    // ── Welcome email ─────────────────────────────────────────────────────────
+
+    /**
+     * Mint a one-time SSO login URL and send the welcome email via HostBill's
+     * built-in mail system (or PHP mail() as a fallback). Best-effort — failures
+     * are non-fatal and do not block provisioning.
+     *
+     * Matches PanelDnsResellerService::sendWelcomeEmail() in the WHMCS module
+     * using the same context fields (portal_url, org_slug, nameservers, soa_email).
+     */
+    private function sendWelcomeEmail(int $subClientId): void
+    {
+        $sso = $this->api->mintSubClientSsoToken($subClientId);
+
+        // SEC: validate returned URL scheme — prevents javascript:/data: injection.
         if (
             !$sso['ok']
             || empty($sso['data']['login_url'])
             || !str_starts_with((string) ($sso['data']['login_url'] ?? ''), 'https://')
         ) {
-            return;  // logged by PanelDnsApiHb; welcome email is best-effort
+            return; // logged by PanelDnsApiHb; welcome email is best-effort
         }
 
         $loginUrl = (string) $sso['data']['login_url'];
 
-        // Pull org metadata for the email body (nameservers, portal URL).
-        $org        = $this->api->getOrg($orgId);
-        $nameservers = '';
-        $portalUrl   = '';
-        if ($org['ok']) {
-            $ns = array_values(array_filter([
-                $org['data']['ns1_hostname'] ?? null,
-                $org['data']['ns2_hostname'] ?? null,
-                $org['data']['ns3_hostname'] ?? null,
-                $org['data']['ns4_hostname'] ?? null,
-            ], fn ($v) => is_string($v) && $v !== ''));
-            $nameservers = implode("\n", $ns);
-            $portalUrl   = $org['data']['links']['portal'] ?? '';
+        // Pull portal URL + org slug from /api/v1/summary.
+        $portalUrl = '';
+        $orgSlug   = '';
+        $sum       = $this->api->summary();
+        if ($sum['ok']) {
+            $portalUrl = (string) ($sum['data']['links']['portal'] ?? '');
+            $orgSlug   = (string) ($sum['data']['org']['slug']    ?? '');
         }
 
-        // HostBill does not expose a global sendMessage() helper the way WHMCS does.
-        // Use HostBill's built-in email system via the Emails component if available,
-        // otherwise fall back to PHP mail().
-        $subject = 'Your PanelDNS Account is Ready';
+        // NS-01: prefer per-product NS overrides; fallback to org nameservers.
+        $ns       = $this->resolveNameservers();
+        $soaEmail = trim((string) ($this->options['option8']['value'] ?? ''));
+        $email    = $this->client_data['email'] ?? '';
+
+        $subject = 'Your PanelDNS DNS Hosting Account is Ready';
         $body    = "Hello,\n\n"
-            . "Your PanelDNS reseller account has been provisioned.\n\n"
+            . "Your PanelDNS DNS hosting account has been set up.\n\n"
             . "Log in now (link valid for 60 seconds):\n{$loginUrl}\n\n"
-            . ($portalUrl   ? "Portal URL:\n{$portalUrl}\n\n" : '')
-            . ($nameservers ? "Your nameservers:\n{$nameservers}\n\n" : '')
-            . "If you need to log in again later, visit your PanelDNS portal URL.\n\n"
-            . "Thank you.";
+            . ($portalUrl ? "Portal URL:\n{$portalUrl}\n\n" : '')
+            . ($orgSlug   ? "Organisation slug: {$orgSlug}\n\n" : '')
+            . (!empty($ns) ? "Your nameservers:\n" . implode("\n", $ns) . "\n\n" : '')
+            . ($soaEmail   ? "SOA Contact Email:\n{$soaEmail}\n\n" : '')
+            . "To log in again later, use your portal URL directly.\n\nThank you.";
 
         if (class_exists('Emails')) {
             // HostBill Emails component — preferred.
@@ -991,6 +1771,16 @@ class paneldns extends HostingModule
         }
     }
 
+    // ── HTML helpers ──────────────────────────────────────────────────────────
+
+    /** Shorthand for htmlspecialchars with ENT_QUOTES + UTF-8. */
+    private function h(mixed $v): string
+    {
+        return htmlspecialchars((string) $v, ENT_QUOTES, 'UTF-8');
+    }
+
+    // ── SSRF guard ────────────────────────────────────────────────────────────
+
     /**
      * Return true if the resolved hostname is a private or unresolvable IP.
      * Used in connect() as a belt-and-braces SSRF pre-flight check.
@@ -999,9 +1789,8 @@ class paneldns extends HostingModule
     {
         // gethostbyname() returns the original string unchanged when DNS lookup fails.
         if ($resolved === $originalHost) {
-            // Could be a raw IP — check if it's private.
             if (!filter_var($resolved, FILTER_VALIDATE_IP)) {
-                return true;  // not an IP and didn't resolve
+                return true; // not an IP and did not resolve
             }
         }
         return filter_var(

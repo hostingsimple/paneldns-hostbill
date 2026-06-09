@@ -152,6 +152,20 @@ class PanelDnsApiHb
 
     public function nameservers(): array { return $this->get('/api/v1/org/nameservers'); }
 
+    public function getResellerLegalVersion(): array { return $this->get('/api/v1/legal-version'); }
+
+    public function createSubClient(array $data): array { return $this->post('/api/v1/sub-clients', $data); }
+
+    public function patchSubClient(int $id, array $data): array { return $this->patch("/api/v1/sub-clients/{$id}", $data); }
+
+    public function deleteSubClient(int $id): array { return $this->delete("/api/v1/sub-clients/{$id}"); }
+
+    public function subClientSummary(int $id): array { return $this->get("/api/v1/sub-clients/{$id}/summary"); }
+
+    public function mintSubClientSsoToken(int $id): array { return $this->post("/api/v1/sub-clients/{$id}/sso-token"); }
+
+    public function searchSubClients(string $email): array { return $this->get('/api/v1/sub-clients', ['search' => $email, 'per_page' => 10]); }
+
     // ── Internals ─────────────────────────────────────────────────────────────
 
     private function request(string $method, string $url, ?array $body = null): array
