@@ -123,7 +123,7 @@ When viewing a service in the HostBill admin area, the module renders a usage ta
 | Zones used / limit | `orgSummary().usage.active_zones` / `plan.zones` |
 | Sub-clients used / limit | `orgSummary().usage.sub_clients` / `plan.clients` |
 | API calls this period | `orgSummary().usage.api_calls_current_period` |
-| Module version | Hardcoded from the class |
+| Module version | Read from `$this->version` (dynamic) |
 
 Two admin action buttons are also shown:
 
@@ -138,9 +138,12 @@ HostBill calls `clientArea()` to render HTML in the client portal service view. 
 returns a self-contained HTML block (no external template files) containing:
 
 - An **SSO login button** (`Login to PanelDNS`) that links to `?action=sso`.
+- A **plan name** line (e.g. "Plan: Agency") above the usage summary.
 - A **usage summary** showing zones and sub-clients used vs. plan limits (non-fatal — falls
   back to showing just the button if `orgSummary()` is unavailable).
 - A **suspension notice** if the org status is `suspended`.
+- A **GDPR consent banner** if `org.requires_consent` is `true` and `option10` (Portal Terms
+  URL) is set — prompts the reseller to re-accept updated terms.
 
 All server-supplied values are escaped with `htmlspecialchars()`.
 
@@ -153,8 +156,10 @@ The module maps PanelDNS usage fields to HostBill's expected keys:
 |---|---|
 | `disk` | `usage.active_zones` |
 | `bandwidth` | `usage.sub_clients` |
+| `disk_limit` | `plan.zones` (0 = unlimited) |
+| `bandwidth_limit` | `plan.clients` (0 = unlimited) |
 
-Returns `['disk' => 0, 'bandwidth' => 0]` on API failure (non-fatal).
+Returns zeros for all keys on API failure (non-fatal). Results are cached for 60 seconds alongside `getServiceDetails()` and `clientArea()`.
 
 ## Drift Sync
 

@@ -43,7 +43,7 @@ class paneldns extends HostingModule
     protected $description = 'PanelDNS — Reseller DNS Management Platform';
 
     /** Module version — bump in lockstep with the repo release tag. */
-    protected $version = '1.1.0';
+    protected $version = '1.2.0';
 
     /**
      * Server fields shown in Settings -> Apps when configuring the server.
@@ -181,6 +181,15 @@ class paneldns extends HostingModule
     // ── Internal state ────────────────────────────────────────────────────────
 
     /** @var PanelDnsApiHb|null */ private $api = null;
+
+    /**
+     * CACHE-01: 60-second in-process summary cache keyed by org ID.
+     * Prevents repeated orgSummary() API calls when HostBill renders the admin
+     * service detail panel, client area, and usage graphs in the same request.
+     *
+     * @var array<int, array{ts: int, resp: array}>
+     */
+    private static array $summaryCache = [];
 
     // ── HostBill lifecycle ────────────────────────────────────────────────────
 
@@ -341,6 +350,22 @@ class paneldns extends HostingModule
                 'portal_privacy_url' => $portalPrivacyUrl ?: null,
             ]);
             $this->api->patchOrg($newId, $patch); // non-fatal
+        }
+
+        // NS-NOTES-01: fetch the org's assigned nameservers and surface them to the
+        // admin via addInfo() so support staff don't need to open PanelDNS to find
+        // the NS to give the client. Mirrors WHMCS writeNameserversToServiceNotes().
+        $orgData = $this->api->getOrg($newId);
+        if ($orgData['ok']) {
+            $ns = array_values(array_filter([
+                $orgData['data']['ns1_hostname'] ?? null,
+                $orgData['data']['ns2_hostname'] ?? null,
+                $orgData['data']['ns3_hostname'] ?? null,
+                $orgData['data']['ns4_hostname'] ?? null,
+            ], fn ($v) => is_string($v) && $v !== ''));
+            if (!empty($ns)) {
+                $this->addInfo('PanelDNS nameservers: ' . implode(', ', $ns));
+            }
         }
 
         // Optionally send welcome email with SSO link.
@@ -626,19 +651,25 @@ class paneldns extends HostingModule
      */
     public function getUsage(): array
     {
-        $empty = ['disk' => 0, 'bandwidth' => 0];
+        $empty = ['disk' => 0, 'bandwidth' => 0, 'disk_limit' => 0, 'bandwidth_limit' => 0];
 
         if (!$this->api) return $empty;
 
         $id = $this->orgId();
         if ($id <= 0) return $empty;
 
-        $resp = $this->api->orgSummary($id);
+        $resp = $this->cachedOrgSummary($id);
         if (!$resp['ok']) return $empty;
 
+        $usage = $resp['data']['usage'] ?? [];
+        $plan  = $resp['data']['plan']  ?? [];
+
         return [
-            'disk'      => (int) ($resp['data']['usage']['active_zones'] ?? 0),
-            'bandwidth' => (int) ($resp['data']['usage']['sub_clients']  ?? 0),
+            'disk'           => (int) ($usage['active_zones'] ?? 0),
+            'bandwidth'      => (int) ($usage['sub_clients']  ?? 0),
+            // Limits: 0 means unlimited in HostBill graph rendering.
+            'disk_limit'     => isset($plan['zones'])   && $plan['zones']   !== null ? (int) $plan['zones']   : 0,
+            'bandwidth_limit'=> isset($plan['clients']) && $plan['clients'] !== null ? (int) $plan['clients'] : 0,
         ];
     }
 
@@ -661,7 +692,7 @@ class paneldns extends HostingModule
             return '<em>PanelDNS: server connection not initialised.</em>';
         }
 
-        $resp = $this->api->orgSummary($id);
+        $resp = $this->cachedOrgSummary($id);
         if (!$resp['ok']) {
             return '<em>PanelDNS: could not load service details.</em>';
         }
@@ -698,7 +729,7 @@ class paneldns extends HostingModule
             . '<tr><th style="text-align:left;padding:3px 8px;">API calls this period</th>'
             .     '<td style="padding:3px 8px;">' . $h((int) ($usage['api_calls_current_period'] ?? 0)) . '</td></tr>'
             . '<tr><th style="text-align:left;padding:3px 8px;">Module version</th>'
-            .     '<td style="padding:3px 8px;">paneldns-hostbill v1.1.0</td></tr>'
+            .     '<td style="padding:3px 8px;">' . $h('paneldns-hostbill v' . $this->version) . '</td></tr>'
             . '</table>';
     }
 
@@ -722,7 +753,7 @@ class paneldns extends HostingModule
             return $ssoButton;
         }
 
-        $resp = $this->api->orgSummary($id);
+        $resp = $this->cachedOrgSummary($id);
 
         if (!$resp['ok']) {
             // Non-fatal: show just the button if summary is unavailable.
@@ -740,9 +771,10 @@ class paneldns extends HostingModule
         $clientsUsed = (int) ($usage['sub_clients']  ?? 0);
         $zonesLimit  = isset($plan['zones'])   && $plan['zones']   !== null ? (int) $plan['zones']   : null;
         $clLimit     = isset($plan['clients']) && $plan['clients'] !== null ? (int) $plan['clients'] : null;
+        $planName    = ($plan['name'] ?? '') !== '' ? $plan['name'] : null;
 
-        $zonesStr   = $h($zonesUsed)   . ' / ' . ($zonesLimit !== null ? $h($zonesLimit)   : '∞') . ' zones';
-        $clientsStr = $h($clientsUsed) . ' / ' . ($clLimit    !== null ? $h($clLimit)      : '∞') . ' sub-clients';
+        $zonesStr   = $h($zonesUsed)   . ' / ' . ($zonesLimit !== null ? $h($zonesLimit) : '∞') . ' zones';
+        $clientsStr = $h($clientsUsed) . ' / ' . ($clLimit    !== null ? $h($clLimit)    : '∞') . ' sub-clients';
 
         $suspendedNote = '';
         if ($status === 'suspended') {
@@ -752,13 +784,32 @@ class paneldns extends HostingModule
                 . '</div>';
         }
 
+        // GDPR-LEGAL-01: surface a re-consent banner when the org owner has not yet
+        // accepted the current platform legal terms. This mirrors the WHMCS module's
+        // paneldns_requires_consent template variable. Only shown when a Terms URL is
+        // configured on the product (option10) — without a URL there is nowhere to link.
+        $consentBanner = '';
+        if ((bool) ($org['requires_consent'] ?? false)) {
+            $portalTermsUrl = trim((string) ($this->options['option10']['value'] ?? ''));
+            if ($portalTermsUrl !== '') {
+                $consentBanner = '<div style="margin-top:10px;padding:10px;background:#fff3cd;'
+                    . 'border:1px solid #ffc107;border-radius:4px;font-size:13px;">'
+                    . '<strong>Action required:</strong> Please '
+                    . '<a href="' . $h($portalTermsUrl) . '" target="_blank" rel="noopener noreferrer">'
+                    . 'review and accept</a> the updated Terms of Service for your PanelDNS portal.'
+                    . '</div>';
+            }
+        }
+
         return '<div>'
             . $ssoButton
             . '<div style="margin-top:12px;font-size:13px;">'
+            . ($planName !== null ? '<div style="margin-bottom:6px;color:#6b7280;">Plan: ' . $h($planName) . '</div>' : '')
             .     '<span style="margin-right:16px;">' . $zonesStr   . '</span>'
             .     '<span>'                             . $clientsStr . '</span>'
             . '</div>'
             . $suspendedNote
+            . $consentBanner
             . '</div>';
     }
 
@@ -828,6 +879,28 @@ class paneldns extends HostingModule
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /**
+     * CACHE-01: fetch org summary, returning the cached result if it is younger
+     * than 60 seconds. Falls through to a live call on cache miss or API error.
+     * resyncStatus() bypasses this and always calls orgSummary() directly so
+     * the admin's explicit "Resync Status" button always returns fresh data.
+     */
+    private function cachedOrgSummary(int $id): array
+    {
+        $now = time();
+        if (
+            isset(self::$summaryCache[$id])
+            && ($now - self::$summaryCache[$id]['ts']) < 60
+        ) {
+            return self::$summaryCache[$id]['resp'];
+        }
+        $resp = $this->api->orgSummary($id);
+        if ($resp['ok']) {
+            self::$summaryCache[$id] = ['ts' => $now, 'resp' => $resp];
+        }
+        return $resp;
+    }
 
     /**
      * Return the stored PanelDNS Org ID for this service, or 0 if not set.

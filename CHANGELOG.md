@@ -1,5 +1,30 @@
 # Changelog
 
+## v1.2.0 — 2026-06-09
+
+### Added
+
+- **60-second in-process summary cache** (`$summaryCache` static property + `cachedOrgSummary()` helper) —
+  `getServiceDetails()`, `clientArea()`, and `getUsage()` now share a 60-second static cache on
+  `orgSummary()` responses, preventing repeated API calls when HostBill renders multiple panels in
+  the same request. `resyncStatus()` bypasses the cache and always fetches live data.
+- **GDPR consent banner in `clientArea()`** — when `org.requires_consent` is `true` and
+  `option10` (Portal Terms of Service URL) is configured, a yellow warning banner is rendered
+  below the usage line prompting the reseller to review and accept updated terms. Mirrors the
+  WHMCS module's `paneldns_requires_consent` template variable.
+- **Nameservers surfaced after `Create()`** — after a successful org creation, the assigned
+  NS hostnames are fetched via `getOrg()` and surfaced as an `addInfo()` message so the admin
+  can immediately give the client their nameserver details without opening PanelDNS. Mirrors
+  WHMCS `writeNameserversToServiceNotes()`.
+- **Plan name in `clientArea()`** — a "Plan: {name}" line is now shown above the zones/sub-clients
+  usage summary when a plan name is available.
+- **Usage limits in `getUsage()`** — `disk_limit` and `bandwidth_limit` keys are now returned
+  alongside `disk` and `bandwidth`, populated from `plan.zones` and `plan.clients` respectively.
+  Returns `0` (unlimited in HostBill graph) when the plan has no cap on that dimension.
+- **Dynamic version in `getServiceDetails()`** — the module version row now reads from
+  `$this->version` rather than a hardcoded string, so it will be correct for all future releases.
+- Version bumped to `1.2.0`.
+
 ## v1.1.0 — 2026-06-09
 
 ### Added
