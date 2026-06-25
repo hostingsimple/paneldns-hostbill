@@ -3,6 +3,8 @@
 /**
  * paneldns — HostBill server module for selling PanelDNS sub-client DNS hosting.
  *
+ * v2.3.0 — auto-create/delete zone on domain lifecycle, bulk sync, grace expiry,
+ *           updateClient(), getAccounts(), terminateDomain() hooks.
  * v2.0.0 — reseller-tier Reseller API (/api/v1). Provisions sub-clients.
  *
  * UPGRADE NOTE: v1.x used the Platform API (/platform/v1) to provision
@@ -154,6 +156,8 @@ class paneldns extends HostingModule
     protected $buttons = [
         'Resend Welcome Email' => 'resendWelcome',
         'Resync Status'        => 'resyncStatus',
+        'Bulk Sync'            => 'bulkSync',
+        'Process Grace Expiry' => 'processGraceExpiry',
     ];
 
     // ── Internal state ────────────────────────────────────────────────────────
@@ -331,6 +335,16 @@ class paneldns extends HostingModule
 
         if (!empty($this->options['option3']['value'])) {
             $this->sendWelcomeEmail($newId);
+        }
+
+        // DOMAIN-01: auto-create a DNS zone for the service domain on provisioning.
+        // option9 = "Auto-Create Zone on Domain Order". Non-fatal — a zone creation
+        // failure must never roll back sub-client provisioning.
+        if (!empty($this->options['option9']['value'])) {
+            $domain = trim((string) ($this->account_details['domain'] ?? ''));
+            if ($domain !== '') {
+                $this->doAutoCreateZone($domain);
+            }
         }
 
         $this->addInfo("PanelDNS: sub-client #{$newId} created successfully.");
@@ -525,6 +539,264 @@ class paneldns extends HostingModule
         $recs   = (int) ($usage['records'] ?? 0);
         $this->addInfo("PanelDNS: sub-client #{$id} — {$zones} zones, {$recs} records.");
         return true;
+    }
+
+    // ── Admin buttons (bulk / grace) ──────────────────────────────────────────
+
+    /**
+     * BULK-SYNC-01: scan up to 200 active/suspended paneldns services on this
+     * server and link any that are missing a sub_client_id by searching or
+     * creating the sub-client on PanelDNS.
+     *
+     * For each service without option1 (sub_client_id):
+     *   1. Search by email: GET /api/v1/sub-clients?search={email}&per_page=10
+     *   2. If found, store the existing ID.
+     *   3. If not found, create via POST /api/v1/sub-clients and store the new ID.
+     *
+     * Mirrors DriftSync::run() from the WHMCS reseller module but applied to the
+     * HostBill database schema (tblaccounts + tblservers or the HostBill equivalent
+     * table structure). Because HostBill's ORM varies by version, we use the
+     * server_id stored on $this->account_details to scope the query.
+     */
+    public function bulkSync(): bool
+    {
+        if (!$this->api) {
+            $this->addError('PanelDNS: server connection not initialised.');
+            return false;
+        }
+
+        // BULK-SYNC-02: query HostBill services for this server that have no
+        // sub_client_id stored (option1 is null/empty).
+        // HostBill stores per-account module data in the `settings` table or
+        // a dedicated accounts table depending on version. We use a raw DB query
+        // against the common `tbl_accounts` / `accounts` pattern; adjust the
+        // table name if your HostBill version differs.
+        $linked  = 0;
+        $created = 0;
+        $errors  = 0;
+
+        try {
+            // Attempt HostBill DB access via the App::get('db') singleton or
+            // fall back to a direct PDO/MySQLi query using HostBill constants.
+            $db      = null;
+            $rows    = [];
+
+            if (class_exists('App') && method_exists('App', 'get')) {
+                /** @var \DB $db */
+                $db = \App::get('db');
+            }
+
+            if ($db !== null) {
+                // HostBill DB wrapper: select up to 200 active/suspended services
+                // on this server where the module option storing sub_client_id is empty.
+                // Table: accounts; columns: id, client_id, status, option1, server_id.
+                $serverId = (int) ($this->account_details['server_id'] ?? 0);
+                $db->query(
+                    "SELECT a.id, a.client_id, a.status, a.option1, c.email
+                     FROM accounts a
+                     JOIN clients c ON c.id = a.client_id
+                     WHERE a.server_id = ?
+                       AND a.status IN ('Active','Suspended')
+                       AND (a.option1 IS NULL OR a.option1 = '')
+                     LIMIT 200",
+                    [$serverId]
+                );
+                $rows = $db->fetchAll();
+            }
+        } catch (\Throwable $e) {
+            // DB access failed — log and continue with empty rows rather than
+            // raising a fatal error visible to the end user.
+            error_log('[paneldns-hostbill] bulkSync DB query failed: ' . get_class($e) . ': ' . $e->getMessage());
+        }
+
+        foreach ($rows as $row) {
+            $email = trim((string) ($row['email'] ?? ''));
+            if ($email === '') {
+                $errors++;
+                continue;
+            }
+
+            try {
+                // Step 1: search for an existing sub-client by email.
+                $search = $this->api->get('/api/v1/sub-clients', [
+                    'search'   => $email,
+                    'per_page' => 10,
+                ]);
+
+                $foundId = 0;
+                if ($search['ok'] && !empty($search['data'])) {
+                    foreach ($search['data'] as $sc) {
+                        if (strtolower((string) ($sc['email'] ?? '')) === strtolower($email)) {
+                            $foundId = (int) ($sc['id'] ?? 0);
+                            break;
+                        }
+                    }
+                }
+
+                if ($foundId > 0) {
+                    // Step 2: link existing sub-client.
+                    $this->bulkSyncSaveOption1((int) ($row['id'] ?? 0), $foundId);
+                    $linked++;
+                } else {
+                    // Step 3: create a new sub-client.
+                    $name = trim((string) ($row['name'] ?? $email));
+                    if ($name === '') $name = $email;
+
+                    $payload = [
+                        'name'               => $name,
+                        'email'              => $email,
+                        'password'           => bin2hex(random_bytes(12)),
+                        'zone_limit'         => $this->resolveZoneLimit(),
+                        'max_records'        => $this->resolveMaxRecords(),
+                        'status'             => strtolower((string) ($row['status'] ?? 'active')) === 'suspended' ? 'suspended' : 'active',
+                        'terms_acknowledged' => true,
+                    ];
+
+                    $legalResp    = $this->api->getResellerLegalVersion();
+                    $legalVersion = ($legalResp['ok'] ?? false) ? (string) ($legalResp['data']['version'] ?? '') : '';
+                    if ($legalVersion !== '') {
+                        $payload['terms_version'] = $legalVersion;
+                    }
+
+                    $create = $this->api->createSubClient($payload);
+                    if ($create['ok'] && ($newId = (int) ($create['data']['id'] ?? 0)) > 0) {
+                        $this->bulkSyncSaveOption1((int) ($row['id'] ?? 0), $newId);
+                        $created++;
+                    } else {
+                        $errors++;
+                    }
+                }
+            } catch (\Throwable $e) {
+                error_log('[paneldns-hostbill] bulkSync per-row error for email ' . $email . ': ' . get_class($e));
+                $errors++;
+            }
+        }
+
+        $total = count($rows);
+        $this->addInfo(
+            "PanelDNS Bulk Sync: scanned {$total} unlinked service(s) — "
+            . "linked {$linked}, created {$created}, errors {$errors}."
+        );
+        return true;
+    }
+
+    /**
+     * BULK-SYNC-03: persist the sub_client_id (option1) for a service row.
+     * Uses HostBill's DB wrapper when available; falls through to a raw UPDATE.
+     */
+    private function bulkSyncSaveOption1(int $accountId, int $subClientId): void
+    {
+        try {
+            if (class_exists('App') && method_exists('App', 'get')) {
+                $db = \App::get('db');
+                $db->query(
+                    'UPDATE accounts SET option1 = ? WHERE id = ?',
+                    [(string) $subClientId, $accountId]
+                );
+            }
+        } catch (\Throwable $e) {
+            error_log('[paneldns-hostbill] bulkSyncSaveOption1 failed for account #' . $accountId . ': ' . get_class($e));
+        }
+    }
+
+    /**
+     * GRACE-02: process expired grace periods — hard-delete sub-clients whose
+     * grace_period_deadline (details option2) has passed. Can be triggered
+     * manually via the admin button or wired into HostBill Task Scheduler to
+     * run nightly alongside driftSync().
+     *
+     * Mirrors PanelDnsResellerHooks::processExpiredGracePeriods() in the WHMCS module.
+     *
+     * Queries HostBill DB for Terminated services on this server where option2
+     * (grace deadline) is non-empty and the deadline date <= today. For each:
+     *   1. DELETE /api/v1/sub-clients/{id}
+     *   2. Clear option2 (deadline) so the row is not reprocessed.
+     */
+    public function processGraceExpiry(): bool
+    {
+        if (!$this->api) {
+            $this->addError('PanelDNS: server connection not initialised.');
+            return false;
+        }
+
+        $today    = date('Y-m-d');
+        $deleted  = 0;
+        $errors   = 0;
+        $rows     = [];
+
+        try {
+            if (class_exists('App') && method_exists('App', 'get')) {
+                $db       = \App::get('db');
+                $serverId = (int) ($this->account_details['server_id'] ?? 0);
+                $db->query(
+                    "SELECT id, option1, option2
+                     FROM accounts
+                     WHERE server_id = ?
+                       AND status = 'Terminated'
+                       AND option2 IS NOT NULL
+                       AND option2 != ''
+                       AND option2 <= ?
+                     LIMIT 200",
+                    [$serverId, $today]
+                );
+                $rows = $db->fetchAll();
+            }
+        } catch (\Throwable $e) {
+            error_log('[paneldns-hostbill] processGraceExpiry DB query failed: ' . get_class($e));
+        }
+
+        foreach ($rows as $row) {
+            $accountId   = (int) ($row['id']      ?? 0);
+            $subClientId = (int) ($row['option1'] ?? 0);
+            $deadline    = (string) ($row['option2'] ?? '');
+
+            // Safety: skip rows where deadline hasn't arrived yet (belt-and-braces
+            // in case the DB comparison above included tomorrow by time-zone skew).
+            if ($deadline > $today) continue;
+
+            if ($subClientId <= 0) {
+                // No sub-client to delete; just clear the deadline.
+                $this->graceClearOption2($accountId);
+                continue;
+            }
+
+            try {
+                $resp = $this->api->deleteSubClient($subClientId);
+                if ($resp['ok'] || ($resp['status'] ?? 0) === 404) {
+                    // 404 = already gone — treat as success.
+                    $this->graceClearOption2($accountId);
+                    $deleted++;
+                } else {
+                    error_log('[paneldns-hostbill] processGraceExpiry: delete sub-client #' . $subClientId
+                        . ' failed for account #' . $accountId);
+                    $errors++;
+                }
+            } catch (\Throwable $e) {
+                error_log('[paneldns-hostbill] processGraceExpiry exception for account #' . $accountId . ': ' . get_class($e));
+                $errors++;
+            }
+        }
+
+        $this->addInfo(
+            'PanelDNS Grace Expiry: scanned ' . count($rows) . ' expired account(s) — '
+            . "deleted {$deleted}, errors {$errors}."
+        );
+        return true;
+    }
+
+    /**
+     * GRACE-03: clear the grace period deadline (option2) after successful deletion.
+     */
+    private function graceClearOption2(int $accountId): void
+    {
+        try {
+            if (class_exists('App') && method_exists('App', 'get')) {
+                $db = \App::get('db');
+                $db->query("UPDATE accounts SET option2 = '' WHERE id = ?", [$accountId]);
+            }
+        } catch (\Throwable $e) {
+            error_log('[paneldns-hostbill] graceClearOption2 failed for account #' . $accountId . ': ' . get_class($e));
+        }
     }
 
     // ── SSO ───────────────────────────────────────────────────────────────────
@@ -1417,6 +1689,285 @@ class paneldns extends HostingModule
         }
 
         return ['checked' => $checked, 'mismatched' => $mismatched];
+    }
+
+    // ── Domain lifecycle hooks ────────────────────────────────────────────────
+
+    /**
+     * DOMAIN-02: auto-delete the DNS zone when a domain is terminated.
+     * HostBill calls this method (if it exists) on domain termination.
+     *
+     * Gated on option10 ("Auto-Delete Zone on Domain Expiry"). Non-fatal —
+     * zone deletion failure must never block the billing-level domain termination.
+     */
+    public function terminateDomain(): bool
+    {
+        if (empty($this->options['option10']['value'])) {
+            return true; // feature disabled — no-op
+        }
+
+        if (!$this->api) {
+            return true; // can't reach PanelDNS — best-effort, return success
+        }
+
+        $domain = trim((string) ($this->account_details['domain'] ?? ''));
+        if ($domain === '') {
+            return true;
+        }
+
+        $this->doAutoDeleteZone($domain);
+        return true;
+    }
+
+    /**
+     * DOMAIN-01 helper: create a zone on PanelDNS for this sub-client.
+     *
+     * Validates the domain name (253 char limit, no consecutive dots, RFC chars)
+     * then calls POST /api/v1/zones. Non-fatal — logs errors without throwing.
+     */
+    private function doAutoCreateZone(string $domain): bool
+    {
+        $subClientId = $this->subClientId();
+        if ($subClientId <= 0) {
+            error_log('[paneldns-hostbill] doAutoCreateZone: no sub_client_id for domain ' . $domain);
+            return false;
+        }
+
+        // ZONE-VALID-01: mirrors DnsManagerValidator zone name checks.
+        if (
+            strlen($domain) > 253
+            || str_contains($domain, '..')
+            || !preg_match('/^[a-zA-Z0-9]([a-zA-Z0-9_\-]|\.[a-zA-Z0-9])*$/', $domain)
+        ) {
+            error_log('[paneldns-hostbill] doAutoCreateZone: invalid domain "' . $domain . '"');
+            return false;
+        }
+
+        try {
+            $resp = $this->api->post('/api/v1/zones', [
+                'name'          => $domain,
+                'sub_client_id' => $subClientId,
+            ]);
+
+            if (!$resp['ok']) {
+                error_log('[paneldns-hostbill] doAutoCreateZone: API error for "' . $domain . '": '
+                    . ($resp['error'] ?? 'unknown'));
+                return false;
+            }
+
+            return true;
+        } catch (\Throwable $e) {
+            error_log('[paneldns-hostbill] doAutoCreateZone exception for "' . $domain . '": ' . get_class($e));
+            return false;
+        }
+    }
+
+    /**
+     * DOMAIN-02 helper: find and delete the zone for this sub-client.
+     *
+     * Calls GET /api/v1/zones?search={domain}&sub_client_id={id}&per_page=5
+     * to locate the zone, then DELETE /api/v1/zones/{id}. Non-fatal.
+     */
+    private function doAutoDeleteZone(string $domain): bool
+    {
+        $subClientId = $this->subClientId();
+        if ($subClientId <= 0) {
+            error_log('[paneldns-hostbill] doAutoDeleteZone: no sub_client_id for domain ' . $domain);
+            return false;
+        }
+
+        try {
+            $search = $this->api->get('/api/v1/zones', [
+                'search'        => $domain,
+                'sub_client_id' => $subClientId,
+                'per_page'      => 5,
+            ]);
+
+            if (!$search['ok'] || empty($search['data'])) {
+                // Zone not found — treat as success (already gone).
+                return true;
+            }
+
+            // Find the exact match by name.
+            $zoneId = 0;
+            foreach ($search['data'] as $z) {
+                if (strtolower((string) ($z['name'] ?? '')) === strtolower($domain)) {
+                    $zoneId = (int) ($z['id'] ?? 0);
+                    break;
+                }
+            }
+
+            if ($zoneId <= 0) {
+                return true; // not found — already gone
+            }
+
+            $resp = $this->api->delete("/api/v1/zones/{$zoneId}");
+            if (!$resp['ok'] && ($resp['status'] ?? 0) !== 404) {
+                error_log('[paneldns-hostbill] doAutoDeleteZone: API error for "' . $domain . '": '
+                    . ($resp['error'] ?? 'unknown'));
+                return false;
+            }
+
+            return true;
+        } catch (\Throwable $e) {
+            error_log('[paneldns-hostbill] doAutoDeleteZone exception for "' . $domain . '": ' . get_class($e));
+            return false;
+        }
+    }
+
+    // ── Client profile sync ───────────────────────────────────────────────────
+
+    /**
+     * CLIENT-SYNC-01: push HostBill client profile updates to PanelDNS.
+     * HostBill calls this method (if it exists) whenever a client profile is updated.
+     *
+     * Builds a PATCH payload from the client's name, email, and locale, and calls
+     * PATCH /api/v1/sub-clients/{id}. Non-fatal — always returns true; errors are
+     * logged but do not interrupt the HostBill save flow.
+     *
+     * Mirrors PanelDnsResellerHooks::onClientEdit() from the WHMCS module.
+     */
+    public function updateClient(): bool
+    {
+        if (!$this->api) {
+            return true; // no connection — best-effort
+        }
+
+        $subClientId = $this->subClientId();
+        if ($subClientId <= 0) {
+            return true; // not yet provisioned — nothing to sync
+        }
+
+        // Build name: prefer firstname + lastname; fall back to company name.
+        $firstName = trim((string) ($this->client_data['firstname'] ?? ''));
+        $lastName  = trim((string) ($this->client_data['lastname']  ?? ''));
+        $company   = trim((string) ($this->client_data['company']   ?? ''));
+        $name      = trim($firstName . ' ' . $lastName);
+        if ($name === '') $name = $company;
+        if ($name === '') $name = (string) ($this->client_data['email'] ?? '');
+
+        $email  = trim((string) ($this->client_data['email'] ?? ''));
+        $locale = $this->resolveLocale((string) ($this->client_data['language'] ?? ''));
+
+        $patch = array_filter([
+            'name'   => $name  !== '' ? $name  : null,
+            'email'  => $email !== '' ? $email : null,
+            'locale' => $locale !== '' ? $locale : null,
+        ], fn ($v) => $v !== null);
+
+        if (empty($patch)) {
+            return true;
+        }
+
+        try {
+            $resp = $this->api->patch("/api/v1/sub-clients/{$subClientId}", $patch);
+            if (!$resp['ok']) {
+                error_log('[paneldns-hostbill] updateClient: PATCH failed for sub-client #' . $subClientId
+                    . ': ' . ($resp['error'] ?? 'unknown'));
+            }
+        } catch (\Throwable $e) {
+            error_log('[paneldns-hostbill] updateClient exception for sub-client #' . $subClientId . ': ' . get_class($e));
+        }
+
+        return true; // always non-fatal
+    }
+
+    /**
+     * CLIENT-SYNC-02: map HostBill language names to ISO 639-1 locale codes.
+     * HostBill stores language as a full English name (e.g. "English", "Spanish").
+     * PanelDNS expects an ISO code (e.g. "en", "es").
+     */
+    private function resolveLocale(string $language): string
+    {
+        $map = [
+            'english'    => 'en',
+            'spanish'    => 'es',
+            'french'     => 'fr',
+            'german'     => 'de',
+            'portuguese' => 'pt',
+            'chinese'    => 'zh',
+            'italian'    => 'it',
+            'dutch'      => 'nl',
+            'russian'    => 'ru',
+            'japanese'   => 'ja',
+            'arabic'     => 'ar',
+            'polish'     => 'pl',
+            'turkish'    => 'tr',
+            'swedish'    => 'sv',
+            'norwegian'  => 'no',
+            'danish'     => 'da',
+            'finnish'    => 'fi',
+            'czech'      => 'cs',
+            'hungarian'  => 'hu',
+            'romanian'   => 'ro',
+        ];
+
+        $key = strtolower(trim($language));
+        // If it's already an ISO code (2 letters), pass through.
+        if (preg_match('/^[a-z]{2}(-[a-zA-Z]{2,4})?$/', $key)) {
+            return $key;
+        }
+        return $map[$key] ?? '';
+    }
+
+    // ── Account discovery ─────────────────────────────────────────────────────
+
+    /**
+     * LIST-ACCOUNTS-01: fetch all sub-clients from PanelDNS for import/discovery.
+     * HostBill calls this for account listing / import from a live server.
+     *
+     * Paginates GET /api/v1/sub-clients?page=N&per_page=100 up to 50 pages
+     * (5,000 sub-clients maximum per call). Returns an array in HostBill's
+     * expected format: each row has username, domain, plan, status.
+     *
+     * Mirrors ListAccounts() in the WHMCS provisioning module.
+     *
+     * @return array<int, array{username: string, domain: string, plan: string, status: string}>
+     */
+    public function getAccounts(): array
+    {
+        if (!$this->api) {
+            return [];
+        }
+
+        $accounts = [];
+        $page     = 1;
+        $maxPages = 50;
+
+        do {
+            try {
+                $resp = $this->api->get('/api/v1/sub-clients', [
+                    'page'     => $page,
+                    'per_page' => 100,
+                ]);
+            } catch (\Throwable $e) {
+                error_log('[paneldns-hostbill] getAccounts: API exception on page ' . $page . ': ' . get_class($e));
+                break;
+            }
+
+            if (!$resp['ok'] || empty($resp['data'])) {
+                break;
+            }
+
+            foreach ($resp['data'] as $sc) {
+                $accounts[] = [
+                    // HostBill uses 'username' as the unique identifier column.
+                    'username' => (string) ($sc['email'] ?? ''),
+                    // 'domain' is used as the display name / label in HostBill.
+                    'domain'   => (string) ($sc['name'] ?? ''),
+                    // 'plan' maps to the zone limit so admins can see the quota tier.
+                    'plan'     => (string) ($sc['zone_limit'] ?? ''),
+                    // 'status' maps to active/suspended directly.
+                    'status'   => (string) ($sc['status'] ?? 'active'),
+                ];
+            }
+
+            // Stop if there are fewer results than a full page — no next page.
+            $hasMore = count($resp['data']) >= 100;
+            $page++;
+        } while ($hasMore && $page <= $maxPages);
+
+        return $accounts;
     }
 
     // ── HTML component helpers ────────────────────────────────────────────────

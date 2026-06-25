@@ -1,5 +1,25 @@
 # Changelog
 
+## v2.3.0 — 2026-06-25
+
+Full lifecycle parity with the PanelDNS WHMCS reseller module.
+
+### Added
+
+- **`terminateDomain()`** — HostBill calls this when a domain expires; if `option10` (auto-delete zone) is set, the matching zone is deleted from the sub-client
+- **`doAutoCreateZone()`** (private) — creates a zone via `POST /api/v1/zones` after successful `Create()` if `option9` (auto-create zone) is set; non-fatal
+- **`doAutoDeleteZone()`** (private) — finds and deletes the matching zone via the API; used by `terminateDomain()`
+- **`updateClient()`** — HostBill calls this when a client's profile is updated; syncs name, email, and locale to the sub-client via `PATCH /api/v1/sub-clients/{id}`; locale is mapped from HostBill language names to ISO codes (en/es/fr/de/pt/zh)
+- **`getAccounts()`** — returns a list of all sub-clients (paginated, up to 50 pages) for HostBill account discovery / import
+- **`bulkSync()`** — new admin button; scans up to 200 active/suspended services on this server; for each without a `sub_client_id`, searches by email and links to the existing sub-client, or creates a new one; reports counts via `addInfo()`
+- **`processGraceExpiry()`** — new admin button (also writable to HostBill Task Scheduler); scans terminated services with a non-empty grace deadline (`details.option2`); for each where `deadline <= today`, calls `DELETE /api/v1/sub-clients/{id}` and clears the field
+
+### Changed
+
+- `$buttons` now includes `'Bulk Sync' => 'bulkSync'` and `'Process Grace Expiry' => 'processGraceExpiry'`
+
+---
+
 ## v2.2.0 — 2026-06-10
 
 ### Added
