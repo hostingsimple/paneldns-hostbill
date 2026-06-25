@@ -16,13 +16,9 @@ on:
 jobs:
   build:
     name: Build release ZIP
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     permissions:
       contents: write   # required to create releases and upload assets
-
-    env:
-      # Opt JavaScript actions into Node 24 ahead of the Node 20 deprecation.
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
     steps:
       - name: Resolve tag name
@@ -97,9 +93,9 @@ jobs:
             1. Download `paneldns-hostbill-${{ steps.tag.outputs.name }}.zip`
             2. Extract and copy the `includes/` folder into your HostBill root
             3. Go to **Settings → Apps → Add New App** and choose **PanelDNS**
-            4. See [README.md](https://github.com/Veeau/paneldns-hostbill/blob/${{ steps.tag.outputs.name }}/README.md) for full configuration instructions
+            4. See [README.md](https://github.com/hostingsimple/paneldns-hostbill/blob/${{ steps.tag.outputs.name }}/README.md) for full configuration instructions
 
-            See [CHANGELOG.md](https://github.com/Veeau/paneldns-hostbill/blob/${{ steps.tag.outputs.name }}/CHANGELOG.md) for what changed.
+            See [CHANGELOG.md](https://github.com/hostingsimple/paneldns-hostbill/blob/${{ steps.tag.outputs.name }}/CHANGELOG.md) for what changed.
           files: |
             dist/paneldns-hostbill-*.zip
           draft: false
