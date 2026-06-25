@@ -1,5 +1,7 @@
 # paneldns-hostbill
 
+[![Latest Release](https://img.shields.io/github/v/release/hostingsimple/paneldns-hostbill)](https://github.com/hostingsimple/paneldns-hostbill/releases/latest) [![Release](https://github.com/hostingsimple/paneldns-hostbill/actions/workflows/release.yml/badge.svg)](https://github.com/hostingsimple/paneldns-hostbill/actions/workflows/release.yml) [![License](https://img.shields.io/github/license/hostingsimple/paneldns-hostbill)](LICENSE) ![PHP](https://img.shields.io/badge/PHP-8.0%2B-777BB4?logo=php&logoColor=white) ![HostBill](https://img.shields.io/badge/HostBill-Latest-blue)
+
 HostBill server module for selling **PanelDNS sub-client DNS hosting** as an orderable product.
 
 This module integrates with the PanelDNS Reseller API (`/api/v1`) so resellers running
