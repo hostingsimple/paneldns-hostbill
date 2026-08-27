@@ -201,7 +201,10 @@ class PanelDnsApiHb
         $status    = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $primaryIp = (string) curl_getinfo($ch, CURLINFO_PRIMARY_IP);
         $err       = curl_error($ch);
-        curl_close($ch);
+        // PHP8-CURL-01: the handle is intentionally left to be freed by refcount. The
+        // explicit close has had no effect since PHP 8.0 and is deprecated in PHP 8.5,
+        // where it emits a deprecation notice on EVERY API call. WHMCS 8.7, HostBill and
+        // Blesta 5 all require PHP 8, so no supported platform still needs it.
 
         $this->logCall($method, $url, $body, $status, $raw, $err);
 
