@@ -54,7 +54,7 @@ class paneldns extends HostingModule
     protected $description = 'PanelDNS — Sub-client DNS Hosting (Reseller)';
 
     /** Module version — bump in lockstep with the repo release tag. */
-    protected $version = '2.2.0';
+    protected $version = '2.4.0';
 
     /**
      * Server fields shown in Settings → Apps when configuring the server.

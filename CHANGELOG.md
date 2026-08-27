@@ -1,5 +1,44 @@
 # Changelog
 
+## v2.4.0 — 2026-08-27
+
+Licence enforcement is now active. Previously this module enforced nothing.
+
+### Changed
+
+- **Licence gate enabled in `doCreate()`.** The gate existed but was commented out, marked
+  "enable when shipping as a paid module", so an install with no active PanelDNS
+  subscription was never blocked from provisioning.
+- **The commented line was also wrong** and would have broken every install if enabled as
+  written. It passed the literal `'reseller'`; the server emits `'whmcs-reseller'`
+  (`REQUIRED_MODULE_RESELLER`). Verified against a live PanelDNS v3.91.8 server with the org
+  on an active plan:
+
+  | slug passed | result |
+  |---|---|
+  | `'reseller'` (as commented) | locked — "status: active (module not unlocked)" |
+  | `'whmcs-reseller'` (constant) | UNLOCKED — "Subscription active" |
+
+  The error a mismatch produces is indistinguishable from an expired plan, so the customer
+  would check their invoice instead of reporting a bug. It now passes the constant, never a
+  literal, so it cannot drift again.
+- **Only provisioning is gated.** Suspend, unsuspend, cancel and every read path stay open,
+  so a lapsed subscription never strands existing customers or blocks a wind-down.
+
+### Fixed
+
+- **Past-due grace window never expired (GRACE-CLOCK-01).** Grace was measured as
+  `now - fetched_at`, but `fetched_at` resets on every successful fetch and the cache
+  refreshes daily, so elapsed time never reached the 7-day threshold — the grace-expired
+  branch was unreachable and a past-due subscription stayed unlocked indefinitely. Now
+  tracked via `first_past_due_at`, preserved across refreshes and cleared on return to
+  active. Simulated day 0→10: locks on day 7.
+- **`curl_close()` removed** (PHP8-CURL-01). Deprecated in PHP 8.5, emitting a notice on
+  every API call.
+- **`$version` corrected from a stale `2.2.0`** to match the release line.
+
+---
+
 ## v2.3.0 — 2026-06-25
 
 Full lifecycle parity with the PanelDNS WHMCS reseller module.
