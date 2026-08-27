@@ -258,10 +258,24 @@ class paneldns extends HostingModule
             return false;
         }
 
-        // Licence gate — enable when shipping as a paid module.
-        // if ($err = PanelDnsLicenceCheckHb::gateOrError($this->api, 'reseller')) {
-        //     $this->addError($err); return false;
-        // }
+        // LICENCE-HB-01: licence gate, live. Gates provisioning ONLY - suspend,
+        // unsuspend, cancel and every read path stay open, so a lapsed subscription
+        // never strands existing customers or blocks an orderly wind-down.
+        //
+        // The slug MUST be REQUIRED_MODULE_RESELLER ('whmcs-reseller'), not the bare
+        // 'reseller' this line carried while commented out. The server never emits
+        // 'reseller', so that spelling matched nothing and would have locked every
+        // install on a healthy active subscription. Verified against a live server on
+        // an active plan:
+        //
+        //   'reseller'        -> locked   "status: active (module not unlocked)"
+        //   'whmcs-reseller'  -> UNLOCKED "Subscription active"
+        //
+        // Use the constant, never a literal, so this cannot drift again.
+        if ($err = PanelDnsLicenceCheckHb::gateOrError($this->api, PanelDnsLicenceCheckHb::REQUIRED_MODULE_RESELLER)) {
+            $this->addError($err);
+            return false;
+        }
 
         // Idempotency: if already provisioned, just unsuspend.
         $existing = $this->subClientId();
