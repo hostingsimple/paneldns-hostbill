@@ -54,10 +54,26 @@ class PanelDnsLicenceCheckHb
         // Fetch fresh.
         $resp = $api->licenceStatus();
         if ($resp['ok']) {
-            $payload = $resp['data'] ?? [];
+            $payload   = $resp['data'] ?? [];
+            $subStatus = $payload['sub_status'] ?? 'unknown';
+
+            // GRACE-CLOCK-01: measure grace from when past_due was FIRST observed, and
+            // preserve that timestamp across refreshes. Measuring from fetched_at makes
+            // the window unreachable: fetched_at resets to now on every successful fetch
+            // and the cache refreshes daily, so elapsed time never exceeds CACHE_TTL
+            // (1 day) and never reaches GRACE_SECONDS (7 days). A past-due subscription
+            // then stays unlocked forever while still reporting "7 day(s) left".
+            //
+            // Null when not past due, so paying up resets the clock and a later lapse
+            // gets a fresh window instead of inheriting the old one.
+            $firstPastDueAt = $subStatus === 'past_due'
+                ? ($cached['first_past_due_at'] ?? $now)
+                : null;
+
             $entry   = [
-                'fetched_at'   => $now,
-                'sub_status'   => $payload['sub_status']        ?? 'unknown',
+                'fetched_at'        => $now,
+                'first_past_due_at' => $firstPastDueAt,
+                'sub_status'   => $subStatus,
                 'modules'      => $payload['modules_unlocked']   ?? [],
                 'expires_at'   => $payload['expires_at']         ?? null,
                 'current_plan' => $payload['current_plan']       ?? null,
@@ -149,7 +165,11 @@ class PanelDnsLicenceCheckHb
         }
 
         if ($sub === 'past_due' && $hasModule) {
-            $secondsPastDue = $now - $fetched;
+            // Fall back to fetched_at only for a cache written before this field existed:
+            // that starts the clock now rather than locking immediately, which is the
+            // right way to be wrong when we do not know when the lapse began.
+            $firstPastDueAt = $cached['first_past_due_at'] ?? $fetched;
+            $secondsPastDue = $now - $firstPastDueAt;
             if ($secondsPastDue < self::GRACE_SECONDS) {
                 $daysLeft = (int) ceil((self::GRACE_SECONDS - $secondsPastDue) / 86400);
                 return [
