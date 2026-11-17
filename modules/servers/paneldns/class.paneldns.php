@@ -3,6 +3,9 @@
 /**
  * paneldns — HostBill server module for selling PanelDNS sub-client DNS hosting.
  *
+ * v2.5.0 — SEC-LINK-01: never link a service to an existing sub-client by email.
+ *           Bulk Sync reports email matches for an admin to verify instead of
+ *           linking them; Create explains an email conflict instead of failing blind.
  * v2.3.0 — auto-create/delete zone on domain lifecycle, bulk sync, grace expiry,
  *           updateClient(), getAccounts(), terminateDomain() hooks.
  * v2.0.0 — reseller-tier Reseller API (/api/v1). Provisions sub-clients.
@@ -54,7 +57,7 @@ class paneldns extends HostingModule
     protected $description = 'PanelDNS — Sub-client DNS Hosting (Reseller)';
 
     /** Module version — bump in lockstep with the repo release tag. */
-    protected $version = '2.4.0';
+    protected $version = '2.5.0';
 
     /**
      * Server fields shown in Settings → Apps when configuring the server.
@@ -311,9 +314,11 @@ class paneldns extends HostingModule
         $servicePassword = trim((string) ($this->account_details['password'] ?? ''));
         $password        = $servicePassword !== '' ? $servicePassword : bin2hex(random_bytes(12));
 
+        $clientEmail = trim((string) ($this->client_data['email'] ?? ''));
+
         $payload = [
             'name'               => $clientName,
-            'email'              => $this->client_data['email'] ?? '',
+            'email'              => $clientEmail,
             'password'           => $password,
             'zone_limit'         => $zoneLimit,
             'max_records'        => $maxRecords,
@@ -326,6 +331,14 @@ class paneldns extends HostingModule
 
         $resp = $this->api->createSubClient($payload);
         if (!$resp['ok']) {
+            // SEC-LINK-01: the email already belongs to a PanelDNS account. Stop and
+            // tell the admin. Do not retry with an altered email, and do not look the
+            // existing account up and store its ID: HostBill does not verify client
+            // emails, so whoever typed it may not own that account.
+            if (self::isEmailConflict($resp)) {
+                $this->addError(self::emailConflictMessage($clientEmail));
+                return false;
+            }
             $this->addError('PanelDNS: sub-client creation failed — see module activity log.');
             return false;
         }
@@ -508,6 +521,12 @@ class paneldns extends HostingModule
         }
 
         $sso = $this->api->mintSubClientSsoToken($id);
+        if (self::isSsoRefusedPlatformAdmin($sso)) {
+            $this->addError('PanelDNS refused to issue a login link: the account linked to this service is a '
+                . 'PanelDNS platform administrator, and PanelDNS never issues single sign-on for those. '
+                . "Check the PanelDNS Sub-client ID on this service (#{$id}).");
+            return false;
+        }
         if (
             !$sso['ok']
             || empty($sso['data']['login_url'])
@@ -559,18 +578,26 @@ class paneldns extends HostingModule
 
     /**
      * BULK-SYNC-01: scan up to 200 active/suspended paneldns services on this
-     * server and link any that are missing a sub_client_id by searching or
-     * creating the sub-client on PanelDNS.
+     * server that have no sub_client_id, and provision a new sub-client for each.
      *
-     * For each service without option1 (sub_client_id):
-     *   1. Search by email: GET /api/v1/sub-clients?search={email}&per_page=10
-     *   2. If found, store the existing ID.
-     *   3. If not found, create via POST /api/v1/sub-clients and store the new ID.
+     * SEC-LINK-01: this never links a service to an EXISTING sub-client. It used to
+     * search by the client's email and store the first exact match, which was an
+     * account takeover: HostBill does not verify client emails, so anyone could sign
+     * up with another customer's address, and the next Bulk Sync handed them that
+     * customer's sub-client (SSO and the embedded DNS manager both follow the
+     * stored ID). For each service without option1 (sub_client_id):
+     *   1. Search by email: GET /api/v1/sub-clients?search={email}&per_page=10.
+     *      An exact match is REPORTED to the admin as a candidate and skipped.
+     *      Nothing is stored.
+     *   2. Otherwise create via POST /api/v1/sub-clients and store the ID that
+     *      PanelDNS issued for that new sub-client.
+     *   3. If the create is refused because the email is taken (the search can
+     *      miss), report it as a candidate too.
+     * Linking a candidate is a manual admin step: confirm the customer owns that
+     * sub-client, then enter its ID in the service's PanelDNS Sub-client ID field.
      *
-     * Mirrors DriftSync::run() from the WHMCS reseller module but applied to the
-     * HostBill database schema (tblaccounts + tblservers or the HostBill equivalent
-     * table structure). Because HostBill's ORM varies by version, we use the
-     * server_id stored on $this->account_details to scope the query.
+     * Because HostBill's ORM varies by version, we use the server_id stored on
+     * $this->account_details to scope the query.
      */
     public function bulkSync(): bool
     {
@@ -585,9 +612,10 @@ class paneldns extends HostingModule
         // a dedicated accounts table depending on version. We use a raw DB query
         // against the common `tbl_accounts` / `accounts` pattern; adjust the
         // table name if your HostBill version differs.
-        $linked  = 0;
-        $created = 0;
-        $errors  = 0;
+        $created    = 0;
+        $errors     = 0;
+        $candidates = []; // list<array{account_id: int, email: string, sub_client_id: int}>
+        $legalVersion = null;
 
         try {
             // Attempt HostBill DB access via the App::get('db') singleton or
@@ -624,64 +652,58 @@ class paneldns extends HostingModule
         }
 
         foreach ($rows as $row) {
-            $email = trim((string) ($row['email'] ?? ''));
-            if ($email === '') {
+            $accountId = (int) ($row['id'] ?? 0);
+            $email     = trim((string) ($row['email'] ?? ''));
+            if ($accountId <= 0 || $email === '') {
                 $errors++;
                 continue;
             }
 
             try {
-                // Step 1: search for an existing sub-client by email.
-                $search = $this->api->get('/api/v1/sub-clients', [
-                    'search'   => $email,
-                    'per_page' => 10,
-                ]);
-
-                $foundId = 0;
-                if ($search['ok'] && !empty($search['data'])) {
-                    foreach ($search['data'] as $sc) {
-                        if (strtolower((string) ($sc['email'] ?? '')) === strtolower($email)) {
-                            $foundId = (int) ($sc['id'] ?? 0);
-                            break;
-                        }
-                    }
+                // Step 1 (SEC-LINK-01): an existing sub-client with this email is a
+                // candidate for the admin to verify. Report it; never store its ID.
+                $candidateId = $this->findSubClientIdByExactEmail($email);
+                if ($candidateId > 0) {
+                    $candidates[] = ['account_id' => $accountId, 'email' => $email, 'sub_client_id' => $candidateId];
+                    continue;
                 }
 
-                if ($foundId > 0) {
-                    // Step 2: link existing sub-client.
-                    $this->bulkSyncSaveOption1((int) ($row['id'] ?? 0), $foundId);
-                    $linked++;
-                } else {
-                    // Step 3: create a new sub-client.
-                    $name = trim((string) ($row['name'] ?? $email));
-                    if ($name === '') $name = $email;
+                // Step 2: create a new sub-client. The ID stored is the one PanelDNS
+                // issued for the sub-client created right here, never one looked up.
+                $name = trim((string) ($row['name'] ?? $email));
+                if ($name === '') $name = $email;
 
-                    $payload = [
-                        'name'               => $name,
-                        'email'              => $email,
-                        'password'           => bin2hex(random_bytes(12)),
-                        'zone_limit'         => $this->resolveZoneLimit(),
-                        'max_records'        => $this->resolveMaxRecords(),
-                        'status'             => strtolower((string) ($row['status'] ?? 'active')) === 'suspended' ? 'suspended' : 'active',
-                        'terms_acknowledged' => true,
-                    ];
+                $payload = [
+                    'name'               => $name,
+                    'email'              => $email,
+                    'password'           => bin2hex(random_bytes(12)),
+                    'zone_limit'         => $this->resolveZoneLimit(),
+                    'max_records'        => $this->resolveMaxRecords(),
+                    'status'             => strtolower((string) ($row['status'] ?? 'active')) === 'suspended' ? 'suspended' : 'active',
+                    'terms_acknowledged' => true,
+                ];
 
+                if ($legalVersion === null) {
                     $legalResp    = $this->api->getResellerLegalVersion();
                     $legalVersion = ($legalResp['ok'] ?? false) ? (string) ($legalResp['data']['version'] ?? '') : '';
-                    if ($legalVersion !== '') {
-                        $payload['terms_version'] = $legalVersion;
-                    }
+                }
+                if ($legalVersion !== '') {
+                    $payload['terms_version'] = $legalVersion;
+                }
 
-                    $create = $this->api->createSubClient($payload);
-                    if ($create['ok'] && ($newId = (int) ($create['data']['id'] ?? 0)) > 0) {
-                        $this->bulkSyncSaveOption1((int) ($row['id'] ?? 0), $newId);
-                        $created++;
-                    } else {
-                        $errors++;
-                    }
+                $create = $this->api->createSubClient($payload);
+                if ($create['ok'] && ($newId = (int) ($create['data']['id'] ?? 0)) > 0) {
+                    $this->bulkSyncSaveOption1($accountId, $newId);
+                    $created++;
+                } elseif (self::isEmailConflict($create)) {
+                    // Step 3: the search missed an existing account (it is a LIKE
+                    // search capped at 10 rows). Same rule: report, do not link.
+                    $candidates[] = ['account_id' => $accountId, 'email' => $email, 'sub_client_id' => 0];
+                } else {
+                    $errors++;
                 }
             } catch (\Throwable $e) {
-                error_log('[paneldns-hostbill] bulkSync per-row error for email ' . $email . ': ' . get_class($e));
+                error_log('[paneldns-hostbill] bulkSync per-row error for account #' . $accountId . ': ' . get_class($e));
                 $errors++;
             }
         }
@@ -689,9 +711,68 @@ class paneldns extends HostingModule
         $total = count($rows);
         $this->addInfo(
             "PanelDNS Bulk Sync: scanned {$total} unlinked service(s) — "
-            . "linked {$linked}, created {$created}, errors {$errors}."
+            . "created {$created}, needs manual review " . count($candidates) . ", errors {$errors}. "
+            . 'No service is ever linked to an existing sub-client automatically.'
         );
+
+        if ($candidates !== []) {
+            $this->addInfo(self::bulkSyncCandidateReport($candidates));
+            foreach ($candidates as $c) {
+                error_log('[paneldns-hostbill] bulkSync: account #' . $c['account_id']
+                    . ' left unlinked; its client email matches an existing PanelDNS account'
+                    . ($c['sub_client_id'] > 0 ? ' (sub-client #' . $c['sub_client_id'] . ')' : '')
+                    . '. Admin must verify ownership and link manually.');
+            }
+        }
         return true;
+    }
+
+    /**
+     * SEC-LINK-01: return the ID of a sub-client whose email exactly matches
+     * (case-insensitive), or 0 when there is none or the lookup fails.
+     *
+     * For REPORTING ONLY. The caller must never store this ID against a service:
+     * a client-entered email is not proof of ownership. A failed lookup returns 0,
+     * which is safe because the follow-up create is refused for a taken email.
+     */
+    private function findSubClientIdByExactEmail(string $email): int
+    {
+        $search = $this->api->searchSubClients($email);
+        if (!$search['ok'] || empty($search['data']) || !is_array($search['data'])) {
+            return 0;
+        }
+        foreach ($search['data'] as $sc) {
+            if (is_array($sc) && strcasecmp((string) ($sc['email'] ?? ''), $email) === 0) {
+                return (int) ($sc['id'] ?? 0);
+            }
+        }
+        return 0;
+    }
+
+    /**
+     * SEC-LINK-01: admin-facing report of services Bulk Sync left unlinked because
+     * their client email matches an existing PanelDNS account. Capped at 20 lines.
+     *
+     * @param list<array{account_id: int, email: string, sub_client_id: int}> $candidates
+     */
+    private static function bulkSyncCandidateReport(array $candidates): string
+    {
+        $lines = [];
+        foreach (array_slice($candidates, 0, 20) as $c) {
+            $lines[] = 'service #' . (int) $c['account_id']
+                . ' (' . htmlspecialchars((string) $c['email'], ENT_QUOTES, 'UTF-8') . ')'
+                . ((int) $c['sub_client_id'] > 0 ? ' matches sub-client #' . (int) $c['sub_client_id'] : ' matches an existing account');
+        }
+        $more = count($candidates) - count($lines);
+        if ($more > 0) {
+            $lines[] = "… and {$more} more (see the server error log)";
+        }
+
+        return 'PanelDNS Bulk Sync: ' . count($candidates) . ' service(s) were NOT linked because their client '
+            . 'email already belongs to a PanelDNS account. HostBill does not verify client email addresses, '
+            . 'so a matching email does not prove the customer owns that account. Verify ownership, then enter '
+            . 'the Sub-client ID on each service by hand, or change the client email and re-run: '
+            . implode('; ', $lines) . '.';
     }
 
     /**
@@ -832,7 +913,17 @@ class paneldns extends HostingModule
             exit();
         }
 
+        // SEC-SSO-01: mint by the stored, PanelDNS-issued sub-client ID only. No email
+        // or other client-controlled value ever chooses the identity logged in as.
         $resp = $this->api->mintSubClientSsoToken($id);
+
+        if (self::isSsoRefusedPlatformAdmin($resp)) {
+            // The client is told only that SSO was refused; the reason goes to the log.
+            error_log('[paneldns-hostbill] ssoLogin refused for sub-client #' . $id
+                . ': PanelDNS will not issue SSO for a platform administrator (sso_refused_platform_admin).');
+            echo $this->h(self::SSO_REFUSED_CLIENT_MESSAGE);
+            exit();
+        }
 
         // SEC: validate returned URL scheme — prevents javascript:/data: injection.
         if (
@@ -1633,6 +1724,13 @@ class paneldns extends HostingModule
         $id   = $this->subClientId();
         $resp = $this->api->mintSubClientSsoToken($id);
 
+        if (self::isSsoRefusedPlatformAdmin($resp)) {
+            error_log('[paneldns-hostbill] client-area SSO refused for sub-client #' . $id
+                . ': PanelDNS will not issue SSO for a platform administrator (sso_refused_platform_admin).');
+            $this->flash('error', self::SSO_REFUSED_CLIENT_MESSAGE);
+            return $this->renderOverview();
+        }
+
         if (
             $resp['ok']
             && !empty($resp['data']['login_url'])
@@ -1835,9 +1933,15 @@ class paneldns extends HostingModule
      * CLIENT-SYNC-01: push HostBill client profile updates to PanelDNS.
      * HostBill calls this method (if it exists) whenever a client profile is updated.
      *
-     * Builds a PATCH payload from the client's name, email, and locale, and calls
-     * PATCH /api/v1/sub-clients/{id}. Non-fatal — always returns true; errors are
-     * logged but do not interrupt the HostBill save flow.
+     * Builds a PATCH payload from the client's name and locale, and calls
+     * PATCH /api/v1/sub-clients/{id}, addressed by the stored sub-client ID only.
+     * Non-fatal — always returns true; errors are logged but do not interrupt the
+     * HostBill save flow.
+     *
+     * SEC-LINK-01: the email is deliberately NOT sent. It is the sub-client's login
+     * identity, HostBill does not verify a changed client email, and PanelDNS keeps
+     * the Reseller API PATCH email-free for the same reason (it ignored the field).
+     * Change a sub-client's email in PanelDNS itself.
      *
      * Mirrors PanelDnsResellerHooks::onClientEdit() from the WHMCS module.
      */
@@ -1860,12 +1964,10 @@ class paneldns extends HostingModule
         if ($name === '') $name = $company;
         if ($name === '') $name = (string) ($this->client_data['email'] ?? '');
 
-        $email  = trim((string) ($this->client_data['email'] ?? ''));
         $locale = $this->resolveLocale((string) ($this->client_data['language'] ?? ''));
 
         $patch = array_filter([
             'name'   => $name  !== '' ? $name  : null,
-            'email'  => $email !== '' ? $email : null,
             'locale' => $locale !== '' ? $locale : null,
         ], fn ($v) => $v !== null);
 
@@ -1935,6 +2037,12 @@ class paneldns extends HostingModule
      * expected format: each row has username, domain, plan, status.
      *
      * Mirrors ListAccounts() in the WHMCS provisioning module.
+     *
+     * SEC-LINK-01: discovery only. The rows carry no Sub-client ID, so an account
+     * imported from this list stays unlinked (subClientId() = 0: no SSO, no DNS
+     * access) until an admin enters its Sub-client ID by hand. Bulk Sync no longer
+     * completes that link by email, so nothing here attaches a HostBill account to
+     * an existing sub-client because the emails match.
      *
      * @return array<int, array{username: string, domain: string, plan: string, status: string}>
      */
@@ -2073,10 +2181,73 @@ class paneldns extends HostingModule
             . '</div>';
     }
 
+    // ── Account-linking safety (SEC-LINK-01 / SEC-SSO-01) ──────────────────────
+
+    /** Shown to the customer when PanelDNS refuses SSO; the reason goes to the log. */
+    private const SSO_REFUSED_CLIENT_MESSAGE =
+        'PanelDNS refused single sign-on for this account. Please contact support.';
+
+    /**
+     * SEC-LINK-01: true when PanelDNS refused a create because the email already
+     * belongs to an existing account:
+     *   - 409 reason=owner_email_exists / user_email_exists (Platform API, PanelDNS 3.104.1+)
+     *   - 422 with an "already taken" error on the email field (Reseller API: a
+     *     sub-client email is unique within the reseller's org)
+     * A 422 for a malformed email is NOT a conflict and is reported as a plain failure.
+     */
+    private static function isEmailConflict(array $resp): bool
+    {
+        $status = (int) ($resp['status'] ?? 0);
+        $reason = (string) ($resp['reason'] ?? '');
+
+        if ($status === 409 && in_array($reason, ['owner_email_exists', 'user_email_exists'], true)) {
+            return true;
+        }
+
+        if ($status === 422) {
+            $emailErrors = $resp['errors']['email'] ?? null;
+            foreach (is_array($emailErrors) ? $emailErrors : [] as $msg) {
+                if (preg_match('/\b(taken|exists|already)\b/i', (string) $msg)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * SEC-LINK-01: admin-facing explanation of an email conflict on create.
+     * The email is client-entered, so it is escaped before it reaches the admin UI.
+     */
+    private static function emailConflictMessage(string $email): string
+    {
+        $shown = $email !== '' ? htmlspecialchars($email, ENT_QUOTES, 'UTF-8') : 'this email address';
+        return "PanelDNS: a PanelDNS account already uses {$shown}. For security, the module will not attach "
+            . 'an existing PanelDNS account to this service automatically. Use a different client email, or '
+            . 'link the service manually: confirm the customer owns that account, then enter its ID in the '
+            . "service's PanelDNS Sub-client ID field.";
+    }
+
+    /**
+     * SEC-SSO-01: true when PanelDNS (3.104.1+) refused to mint SSO because the
+     * resolved user is a platform super-admin.
+     */
+    private static function isSsoRefusedPlatformAdmin(array $resp): bool
+    {
+        return (int) ($resp['status'] ?? 0) === 403
+            && ($resp['reason'] ?? null) === 'sso_refused_platform_admin';
+    }
+
     // ── Core helpers ──────────────────────────────────────────────────────────
 
     /**
      * Return the stored PanelDNS Sub-client ID for this service, or 0 if not set.
+     *
+     * SEC-LINK-01: this ID is the ONLY thing that ties a service to a PanelDNS
+     * account. It is written by Create()/Bulk Sync from the ID PanelDNS returned
+     * for a sub-client they just created, or typed in by an admin. Never derive it
+     * from an email or any other client-entered field.
      */
     private function subClientId(): int
     {
@@ -2398,6 +2569,12 @@ class paneldns extends HostingModule
     private function sendWelcomeEmail(int $subClientId): void
     {
         $sso = $this->api->mintSubClientSsoToken($subClientId);
+
+        if (self::isSsoRefusedPlatformAdmin($sso)) {
+            error_log('[paneldns-hostbill] welcome email not sent for sub-client #' . $subClientId
+                . ': PanelDNS will not issue SSO for a platform administrator (sso_refused_platform_admin).');
+            return;
+        }
 
         // SEC: validate returned URL scheme — prevents javascript:/data: injection.
         if (

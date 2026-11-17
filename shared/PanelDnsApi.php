@@ -119,6 +119,12 @@ class PanelDnsApiHb
 
     public function getLegalVersion(): array { return $this->get('/platform/v1/legal-version'); }
 
+    /**
+     * SEC-LINK-01: PanelDNS 3.104.1+ answers 409 reason=owner_email_exists when
+     * owner.email already belongs to a PanelDNS account, and creates nothing. Callers
+     * must surface that to the admin and stop. Never retry with a modified email, and
+     * never fall back to looking the account up by email and attaching it.
+     */
     public function createOrg(array $data): array { return $this->post('/platform/v1/orgs', $data); }
 
     public function getOrg(int $id): array { return $this->get("/platform/v1/orgs/{$id}"); }
@@ -138,12 +144,16 @@ class PanelDnsApiHb
 
     public function orgSummary(int $id): array { return $this->get("/platform/v1/orgs/{$id}/summary"); }
 
-    public function mintOrgSsoToken(int $id, ?string $email = null): array
+    /**
+     * SEC-SSO-01: takes the org ID only. It used to accept an optional user_email and
+     * forward it, which let whoever controlled that string choose which PanelDNS user
+     * the SSO token logged in as. A billing-system email is client-entered and
+     * unverified, so it must never pick the identity. PanelDNS 3.104.1+ answers 403
+     * reason=sso_refused_platform_admin when the resolved user is a platform admin.
+     */
+    public function mintOrgSsoToken(int $id): array
     {
-        return $this->post(
-            "/platform/v1/orgs/{$id}/sso-token",
-            $email ? ['user_email' => $email] : []
-        );
+        return $this->post("/platform/v1/orgs/{$id}/sso-token");
     }
 
     // ── Reseller tier helpers ─────────────────────────────────────────────────
@@ -164,6 +174,11 @@ class PanelDnsApiHb
 
     public function mintSubClientSsoToken(int $id): array { return $this->post("/api/v1/sub-clients/{$id}/sso-token"); }
 
+    /**
+     * SEC-LINK-01: for reporting candidates to an admin only. A match on a
+     * client-entered email proves nothing about who owns the sub-client, so the
+     * result must never be stored against a service automatically.
+     */
     public function searchSubClients(string $email): array { return $this->get('/api/v1/sub-clients', ['search' => $email, 'per_page' => 10]); }
 
     // ── Internals ─────────────────────────────────────────────────────────────
@@ -223,7 +238,23 @@ class PanelDnsApiHb
             ];
         }
 
-        $decoded = json_decode($raw ?: 'null', true);
+        return self::shapeResponse($status, is_string($raw) ? $raw : '');
+    }
+
+    /**
+     * Turn a status code and raw body into the result array every caller uses.
+     *
+     * SEC-LINK-01: 'reason' carries PanelDNS's machine-readable refusal code
+     * (owner_email_exists, user_email_exists, sso_refused_platform_admin) and
+     * 'errors' carries Laravel's per-field validation messages (a 422 for a sub-client
+     * email already used in the org), so callers can tell an email conflict apart
+     * from any other failure without parsing the human-readable message.
+     *
+     * @internal public for unit testing.
+     */
+    public static function shapeResponse(int $status, string $raw): array
+    {
+        $decoded = json_decode($raw !== '' ? $raw : 'null', true);
         $ok      = $status >= 200 && $status < 300 && is_array($decoded) && !empty($decoded['ok']);
 
         return [
@@ -231,6 +262,8 @@ class PanelDnsApiHb
             'status'   => $status,
             'data'     => is_array($decoded) ? ($decoded['data'] ?? $decoded) : null,
             'error'    => $ok ? null : ($decoded['error'] ?? "HTTP {$status}"),
+            'reason'   => (!$ok && is_array($decoded) && is_string($decoded['reason'] ?? null)) ? $decoded['reason'] : null,
+            'errors'   => (!$ok && is_array($decoded) && is_array($decoded['errors'] ?? null)) ? $decoded['errors'] : null,
             'raw_body' => $raw,
         ];
     }
