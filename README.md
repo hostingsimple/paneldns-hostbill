@@ -21,6 +21,11 @@ the HostBill client portal.
 - cURL extension enabled
 - An active PanelDNS **reseller** account with a Sanctum API token
   (PanelDNS Dashboard → API Tokens → Create Token, scope: `sub_clients:read sub_clients:write`)
+- **PanelDNS 3.104.1 or later** on the server. Module v2.5.0 stops linking HostBill services
+  to existing PanelDNS accounts by email (see [Security Notes](#security-notes)). PanelDNS
+  before 3.104.1 still attaches an existing account when a Platform API caller creates an
+  org with that account's email, and still issues SSO for platform admins, so upgrading this
+  module alone does not close that route. Upgrade PanelDNS as well.
 
 ## Installation
 
@@ -101,6 +106,36 @@ The PanelDNS Sub-client ID is stored in the **PanelDNS Sub-client ID** per-accou
 If `Create()` is called on a service that already has a Sub-client ID stored,
 the module unsuspends the existing sub-client instead of creating a duplicate.
 
+### Email already in use
+
+If PanelDNS refuses the new sub-client because its email is already in use, `Create()`
+fails with this admin message:
+
+> PanelDNS: a PanelDNS account already uses `<email>`. For security, the module will not
+> attach an existing PanelDNS account to this service automatically. Use a different client
+> email, or link the service manually: confirm the customer owns that account, then enter its
+> ID in the service's PanelDNS Sub-client ID field.
+
+The module never retries with a modified email and never looks the existing account up to
+attach it. See [Linking an existing sub-client](#linking-an-existing-sub-client).
+
+### Linking an existing sub-client
+
+A service is tied to a PanelDNS sub-client **only** by the **PanelDNS Sub-client ID**
+field. The module fills it in with the ID PanelDNS returns for a sub-client it has just
+created. Nothing in the module fills it in by matching email addresses or any other
+client-entered data.
+
+To attach a sub-client that already exists (a migration, or an account flagged by
+**Bulk Sync**):
+
+1. Confirm out of band that the HostBill client owns that sub-client. A matching email is
+   not proof: HostBill does not verify client email addresses.
+2. Enter the sub-client's numeric ID in the service's **PanelDNS Sub-client ID** field.
+
+Accounts imported through HostBill's account import (`getAccounts()`) also arrive unlinked
+and need this step.
+
 ## Per-Account Details
 
 After provisioning, the service detail page in HostBill admin shows:
@@ -114,12 +149,16 @@ After provisioning, the service detail page in HostBill admin shows:
 When the client clicks the SSO link in their HostBill portal, HostBill calls the module's
 `ssoLogin()` method. The module:
 
-1. Fetches a one-time login URL from `POST /api/v1/sub-clients/{id}/sso-token`.
+1. Fetches a one-time login URL from `POST /api/v1/sub-clients/{id}/sso-token`, using the
+   stored Sub-client ID. No email or other client-entered value is sent.
 2. Validates that the returned URL starts with `https://` (prevents redirect injection).
 3. Issues a `302 Location` redirect to the login URL.
 
 The SSO token is valid for 60 seconds. If the mint request fails, a plain-text error message
-is shown and the redirect does not happen.
+is shown and the redirect does not happen. If PanelDNS refuses because the linked account is
+a platform administrator (403 `sso_refused_platform_admin`, PanelDNS 3.104.1+), the customer
+sees "PanelDNS refused single sign-on for this account. Please contact support." The reason
+is written to the server error log, and **Resend Welcome Email** tells the admin.
 
 Clients can also navigate to their portal directly from the embedded DNS manager via the
 **Open Full Portal** button (JavaScript `window.location.href` redirect).
@@ -145,12 +184,22 @@ When viewing a service in the HostBill admin area, the module renders a usage ta
 
 **Progress bars** are colour-coded: blue (< 75%), amber (75–90%), red (≥ 90%).
 
-Two admin action buttons are also shown:
+Four admin action buttons are also shown:
 
 | Button | Method | Action |
 |---|---|---|
 | **Resend Welcome Email** | `resendWelcome()` | Mints a fresh SSO token and resends the welcome email |
 | **Resync Status** | `resyncStatus()` | Fetches live sub-client summary and shows zone/record counts |
+| **Bulk Sync** | `bulkSync()` | Scans up to 200 active/suspended services on this server that have no Sub-client ID. Creates a new sub-client for each and stores its ID. A service whose client email matches an existing sub-client is **reported, not linked**. |
+| **Process Grace Expiry** | `processGraceExpiry()` | Deletes sub-clients of terminated services whose grace deadline has passed |
+
+**Bulk Sync never links a service to an existing sub-client.** If a service's client email
+matches a sub-client that already exists, or PanelDNS refuses the create because the email is
+taken, Bulk Sync leaves that service unlinked. It lists the service and the matching
+sub-client ID under "needs manual review". Before v2.5.0 Bulk Sync linked these
+automatically, which let anyone who signed up with another customer's email take over that
+customer's DNS. If you ran Bulk Sync on an earlier version, review the services it linked.
+See [Linking an existing sub-client](#linking-an-existing-sub-client).
 
 ## Embedded DNS Manager (Client Area)
 
@@ -312,6 +361,18 @@ includes/modules/Hosting/paneldns/
 - All client-area output is escaped with `htmlspecialchars()` — no raw user data in HTML.
 - Zone ownership is verified on every zone action (`fetchOwnZone()` checks `sub_client_id`).
 - Record content is validated against a 13-type allowlist and length limits before any API call.
+- **No linking by email (SEC-LINK-01, v2.5.0).** HostBill does not verify client email
+  addresses, so the module treats the email as attacker-controlled. A service is tied to a
+  PanelDNS account only by the stored Sub-client ID. That ID comes from a sub-client the
+  module has just created, or an admin enters it by hand. Bulk Sync reports email matches
+  instead of linking them. Create reports an email conflict instead of attaching the existing
+  account, and never retries with an altered email. Client profile sync does not send the
+  email.
+- **SSO identity is never client-chosen (SEC-SSO-01).** SSO tokens are minted by the stored ID
+  only. The API client's `mintOrgSsoToken()` no longer accepts a `user_email`. A PanelDNS
+  refusal to issue SSO for a platform admin is shown as a refusal, never retried another way.
+- Requires PanelDNS 3.104.1+ on the server for the platform-side half of this fix (see
+  [Requirements](#requirements)).
 
 ## Development
 

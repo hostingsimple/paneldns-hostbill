@@ -1,5 +1,69 @@
 # Changelog
 
+## v2.5.0 — 2026-11-17
+
+Security release. **Upgrade promptly, and run PanelDNS 3.104.1 or later.**
+
+### Security
+
+- **Bulk Sync no longer links services to existing sub-clients by email (SEC-LINK-01,
+  critical).** For each service with no Sub-client ID, Bulk Sync searched PanelDNS for a
+  sub-client with the client's email and stored the first exact match. HostBill does not
+  verify client email addresses, so anyone could sign up with another customer's email,
+  and the next Bulk Sync handed them that customer's sub-client. The SSO link and the
+  embedded DNS manager both follow the stored ID, so that meant full control of the
+  victim's DNS zones. Bulk Sync now:
+  - creates a new sub-client for an unlinked service and stores the ID PanelDNS issued for
+    it, as before;
+  - **reports** any service whose email matches an existing sub-client, or whose create is
+    refused because the email is taken, and leaves it unlinked. The admin message lists each
+    service and the matching sub-client ID. Linking is a manual step: confirm the customer
+    owns that sub-client, then enter its ID in the service's **PanelDNS Sub-client ID** field.
+  - says `needs manual review N` where it used to say `linked N`.
+
+  Services linked by an earlier Bulk Sync run keep their stored ID. **Review them:** for
+  each service that Bulk Sync linked rather than created, confirm the HostBill client
+  really owns that sub-client.
+- **Create explains an email conflict (SEC-LINK-01).** When PanelDNS refuses a new account
+  because its email is already in use (422 on the Reseller API; 409 `owner_email_exists` /
+  `user_email_exists` on the Platform API), the admin now sees "A PanelDNS account already
+  uses `<email>`. For security, the module will not attach an existing PanelDNS account to
+  this service automatically. Use a different client email, or link the service manually…"
+  instead of a generic failure. The module never retries with a modified email and never
+  looks the existing account up to attach it.
+- **SSO never takes a client-controlled identity (SEC-SSO-01).** `PanelDnsApiHb::mintOrgSsoToken()`
+  no longer accepts or forwards a `user_email`. The module never called it, but the
+  parameter let any caller choose which PanelDNS user an SSO token logged in as. Sub-client
+  SSO was already minted by the stored sub-client ID only.
+- **SSO refusal for platform admins is reported clearly.** A 403
+  `sso_refused_platform_admin` from PanelDNS 3.104.1+ shows the customer "PanelDNS refused
+  single sign-on for this account. Please contact support.", logs the reason, and tells the
+  admin on **Resend Welcome Email** that the linked account is a platform administrator.
+  The welcome email is skipped in that case.
+- **Client profile sync no longer sends the email (SEC-LINK-01).** `updateClient()` sent the
+  HostBill client's email in its PATCH. PanelDNS already ignored it (the sub-client's email
+  is its login identity and is not patchable over the Reseller API), so nothing changes in
+  practice; the module no longer pushes an unverified email toward an account identity.
+  Change a sub-client's email in PanelDNS.
+
+### Changed
+
+- `PanelDnsApiHb` results now carry `reason` (PanelDNS's refusal code, e.g.
+  `owner_email_exists`) and `errors` (per-field validation messages) on failure, via the
+  new `PanelDnsApiHb::shapeResponse()`.
+- Bulk Sync fetches the legal-terms version once per run instead of once per service, and
+  its per-row error log names the service ID rather than the client email.
+
+### Requirements
+
+- **PanelDNS 3.104.1 or later.** This module uses the Reseller API, where sub-client emails
+  were already unique per org, so the module is safe against older servers. But PanelDNS
+  before 3.104.1 still attaches an existing account when a Platform API caller creates an
+  org with that account's email, and still issues SSO for platform admins. Upgrade the
+  PanelDNS server too.
+
+---
+
 ## v2.4.0 — 2026-08-27
 
 Licence enforcement is now active. Previously this module enforced nothing.
@@ -48,9 +112,9 @@ Full lifecycle parity with the PanelDNS WHMCS reseller module.
 - **`terminateDomain()`** — HostBill calls this when a domain expires; if `option10` (auto-delete zone) is set, the matching zone is deleted from the sub-client
 - **`doAutoCreateZone()`** (private) — creates a zone via `POST /api/v1/zones` after successful `Create()` if `option9` (auto-create zone) is set; non-fatal
 - **`doAutoDeleteZone()`** (private) — finds and deletes the matching zone via the API; used by `terminateDomain()`
-- **`updateClient()`** — HostBill calls this when a client's profile is updated; syncs name, email, and locale to the sub-client via `PATCH /api/v1/sub-clients/{id}`; locale is mapped from HostBill language names to ISO codes (en/es/fr/de/pt/zh)
+- **`updateClient()`** — HostBill calls this when a client's profile is updated; syncs name, email, and locale to the sub-client via `PATCH /api/v1/sub-clients/{id}`; locale is mapped from HostBill language names to ISO codes (en/es/fr/de/pt/zh). *(v2.5.0: the email is no longer sent — see SEC-LINK-01.)*
 - **`getAccounts()`** — returns a list of all sub-clients (paginated, up to 50 pages) for HostBill account discovery / import
-- **`bulkSync()`** — new admin button; scans up to 200 active/suspended services on this server; for each without a `sub_client_id`, searches by email and links to the existing sub-client, or creates a new one; reports counts via `addInfo()`
+- **`bulkSync()`** — new admin button; scans up to 200 active/suspended services on this server; for each without a `sub_client_id`, searches by email and links to the existing sub-client, or creates a new one; reports counts via `addInfo()`. *(v2.5.0: linking by email was an account-takeover route and is removed. Email matches are now reported for manual review — see SEC-LINK-01.)*
 - **`processGraceExpiry()`** — new admin button (also writable to HostBill Task Scheduler); scans terminated services with a non-empty grace deadline (`details.option2`); for each where `deadline <= today`, calls `DELETE /api/v1/sub-clients/{id}` and clears the field
 
 ### Changed
